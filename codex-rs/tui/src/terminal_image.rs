@@ -18,7 +18,6 @@ use anyhow::Context;
 use anyhow::Result;
 use base64::Engine as _;
 use base64::engine::general_purpose;
-use codex_terminal_detection::terminal_info;
 
 const ESC: &str = "\x1b";
 const ST: &str = "\x1b\\";
@@ -26,7 +25,7 @@ const KITTY_CHUNK_SIZE: usize = 4096;
 const KITTY_UNICODE_PLACEHOLDER_MIN_VERSION: (u64, u64, u64) = (0, 28, 0);
 const GHOSTTY_UNICODE_PLACEHOLDER_MIN_VERSION: (u64, u64, u64) = (1, 0, 0);
 const KITTY_PLACEHOLDER_MAX_COLUMNS: u16 = 240;
-pub(crate) const MULTIPLEXER_ENV_VARS: [&str; 6] = [
+const MULTIPLEXER_ENV_VARS: [&str; 6] = [
     "TMUX",
     "TMUX_PANE",
     "ZELLIJ",
@@ -41,6 +40,15 @@ static STARTUP_KITTY_GRAPHICS_TERMINAL: OnceLock<Option<KittyGraphicsTerminal>> 
 pub(crate) enum KittyGraphicsTerminal {
     Kitty { version: (u64, u64, u64) },
     Ghostty { version: (u64, u64, u64) },
+}
+
+impl KittyGraphicsTerminal {
+    fn unicode_placeholders_supported(self) -> bool {
+        match self {
+            Self::Kitty { version } => version >= KITTY_UNICODE_PLACEHOLDER_MIN_VERSION,
+            Self::Ghostty { version } => version >= GHOSTTY_UNICODE_PLACEHOLDER_MIN_VERSION,
+        }
+    }
 }
 
 /// An in-memory PNG and the dimensions of its Kitty virtual placement.
@@ -237,13 +245,6 @@ enum KittyPlacement {
     UnicodePlaceholder { placement_id: u32 },
 }
 
-#[derive(Clone, Copy, Default)]
-struct KittyCapabilities {
-    ansi_color_metadata: bool,
-    multiplexer: bool,
-    queried_terminal: Option<KittyGraphicsTerminal>,
-}
-
 pub(crate) fn set_kitty_graphics_terminal_from_startup_probe(
     terminal: Option<KittyGraphicsTerminal>,
 ) {
@@ -255,30 +256,16 @@ pub(crate) fn set_kitty_graphics_terminal_from_startup_probe(
 /// Multiplexers are intentionally rejected: virtual placements can escape pane boundaries or
 /// become detached from the scrollback rows that carry their placeholders.
 pub(crate) fn kitty_unicode_placeholders_supported() -> bool {
-    let info = terminal_info();
-    kitty_unicode_placeholders_supported_for_terminal(KittyCapabilities {
-        ansi_color_metadata: env::var_os("NO_COLOR").is_none(),
-        multiplexer: info.multiplexer.is_some() || multiplexer_environment_present(),
-        queried_terminal: STARTUP_KITTY_GRAPHICS_TERMINAL.get().copied().flatten(),
-    })
+    env::var_os("NO_COLOR").is_none()
+        && !multiplexer_environment_present()
+        && STARTUP_KITTY_GRAPHICS_TERMINAL
+            .get()
+            .copied()
+            .flatten()
+            .is_some_and(KittyGraphicsTerminal::unicode_placeholders_supported)
 }
 
-fn kitty_unicode_placeholders_supported_for_terminal(capabilities: KittyCapabilities) -> bool {
-    capabilities.ansi_color_metadata
-        && !capabilities.multiplexer
-        && capabilities
-            .queried_terminal
-            .is_some_and(|terminal| match terminal {
-                KittyGraphicsTerminal::Kitty { version } => {
-                    version >= KITTY_UNICODE_PLACEHOLDER_MIN_VERSION
-                }
-                KittyGraphicsTerminal::Ghostty { version } => {
-                    version >= GHOSTTY_UNICODE_PLACEHOLDER_MIN_VERSION
-                }
-            })
-}
-
-fn multiplexer_environment_present() -> bool {
+pub(crate) fn multiplexer_environment_present() -> bool {
     MULTIPLEXER_ENV_VARS
         .into_iter()
         .any(|name| env::var_os(name).is_some())
@@ -324,8 +311,9 @@ pub(crate) fn kitty_transmit_png_file_with_id(
     let path = path
         .canonicalize()
         .with_context(|| format!("canonicalize {}", path.display()))?;
-    let command = kitty_png_file_command(&path, columns, rows, image_id);
-    Ok(wrap_for_tmux_if_needed(command))
+    Ok(wrap_for_tmux_if_needed(kitty_png_file_command(
+        &path, columns, rows, image_id,
+    )))
 }
 
 fn kitty_png_command(

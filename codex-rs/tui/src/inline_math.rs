@@ -27,6 +27,7 @@ pub(crate) struct PreparedInlineMath<'a> {
     markdown: Cow<'a, str>,
     mask: Option<char>,
     spans: Vec<InlineMathSpan>,
+    display_math: Vec<crate::display_math::DisplayMathSpan<'a>>,
     pending_display_math_start: Option<usize>,
     renders_literal: bool,
 }
@@ -38,6 +39,7 @@ impl<'a> PreparedInlineMath<'a> {
                 markdown: Cow::Borrowed(source),
                 mask: None,
                 spans: Vec::new(),
+                display_math: Vec::new(),
                 pending_display_math_start: None,
                 renders_literal: false,
             };
@@ -48,20 +50,22 @@ impl<'a> PreparedInlineMath<'a> {
                 markdown: Cow::Borrowed(source),
                 mask: None,
                 spans: Vec::new(),
+                display_math: Vec::new(),
                 pending_display_math_start: None,
                 renders_literal: true,
             };
         };
         let prepared_display = crate::display_math::PreparedDisplayMath::new(source, mask);
-        let (display_markdown, display_math_ranges, pending_display_math_start) =
+        let (display_markdown, display_math, pending_display_math_start) =
             prepared_display.into_parts();
-        let eligible = eligible_text(&display_markdown, display_math_ranges);
-        let ranges = inline_math_ranges(source, &eligible);
+        let eligible = eligible_text(&display_markdown);
+        let ranges = inline_math_ranges(source, &eligible, &display_math);
         if ranges.is_empty() && matches!(display_markdown, Cow::Borrowed(_)) {
             return Self {
                 markdown: Cow::Borrowed(source),
                 mask: None,
                 spans: Vec::new(),
+                display_math,
                 pending_display_math_start,
                 renders_literal: false,
             };
@@ -89,6 +93,7 @@ impl<'a> PreparedInlineMath<'a> {
             ),
             mask: Some(char::from(mask)),
             spans,
+            display_math,
             pending_display_math_start,
             renders_literal: false,
         }
@@ -108,17 +113,19 @@ impl<'a> PreparedInlineMath<'a> {
         self.renders_literal
     }
 
-    pub(crate) fn into_parts(self) -> (Cow<'a, str>, Option<char>, Vec<InlineMathSpan>) {
-        (self.markdown, self.mask, self.spans)
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Cow<'a, str>,
+        Option<char>,
+        Vec<InlineMathSpan>,
+        Vec<crate::display_math::DisplayMathSpan<'a>>,
+    ) {
+        (self.markdown, self.mask, self.spans, self.display_math)
     }
 }
 
-struct EligibleText {
-    text: Vec<Range<usize>>,
-    display_math: Vec<Range<usize>>,
-}
-
-fn eligible_text(markdown: &str, display_math_ranges: Vec<Range<usize>>) -> EligibleText {
+fn eligible_text(markdown: &str) -> Vec<Range<usize>> {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TABLES);
@@ -156,10 +163,7 @@ fn eligible_text(markdown: &str, display_math_ranges: Vec<Range<usize>>) -> Elig
             _ => {}
         }
     }
-    EligibleText {
-        text,
-        display_math: display_math_ranges,
-    }
+    text
 }
 
 fn inline_html_tag(html: &str, name: &str, closing: bool) -> bool {
@@ -189,7 +193,11 @@ fn inline_html_tag(html: &str, name: &str, closing: bool) -> bool {
         && (closing || !html.trim_end().ends_with("/>"))
 }
 
-fn inline_math_ranges(source: &str, eligible: &EligibleText) -> Vec<Range<usize>> {
+fn inline_math_ranges(
+    source: &str,
+    eligible: &[Range<usize>],
+    display_math: &[crate::display_math::DisplayMathSpan<'_>],
+) -> Vec<Range<usize>> {
     let bytes = source.as_bytes();
     let mut ranges = Vec::new();
     let mut opener = None;
@@ -211,7 +219,7 @@ fn inline_math_ranges(source: &str, eligible: &EligibleText) -> Vec<Range<usize>
 
         match bytes[cursor + 1] {
             b'(' => {
-                if position_is_eligible(&eligible.text, cursor + 1) {
+                if position_is_eligible(eligible, cursor + 1) {
                     // A nested opener restarts recognition at the innermost explicit pair. This
                     // keeps malformed prefixes from repeatedly rescanning a streaming line.
                     opener = Some(cursor);
@@ -221,8 +229,8 @@ fn inline_math_ranges(source: &str, eligible: &EligibleText) -> Vec<Range<usize>
                 if let Some(start) = opener.take() {
                     let range = start..cursor + 2;
                     if !source[start + 2..cursor].trim().is_empty()
-                        && position_is_eligible(&eligible.text, cursor + 1)
-                        && !overlaps_any(range.clone(), &eligible.display_math)
+                        && position_is_eligible(eligible, cursor + 1)
+                        && !overlaps_any(range.clone(), display_math)
                     {
                         ranges.push(range);
                     }
@@ -253,11 +261,14 @@ fn delimiter_is_escaped(bytes: &[u8], delimiter_start: usize) -> bool {
         == 1
 }
 
-fn overlaps_any(candidate: Range<usize>, ranges: &[Range<usize>]) -> bool {
-    let index = ranges.partition_point(|range| range.end <= candidate.start);
-    ranges
+fn overlaps_any(
+    candidate: Range<usize>,
+    spans: &[crate::display_math::DisplayMathSpan<'_>],
+) -> bool {
+    let index = spans.partition_point(|span| span.source_range.end <= candidate.start);
+    spans
         .get(index)
-        .is_some_and(|range| range.start < candidate.end)
+        .is_some_and(|span| span.source_range.start < candidate.end)
 }
 
 #[cfg(test)]

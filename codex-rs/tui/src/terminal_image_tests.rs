@@ -61,74 +61,31 @@ fn tmux_passthrough_wraps_and_escapes_control_sequence() {
 }
 
 #[test]
-fn unicode_placeholders_require_a_supported_probe_without_a_multiplexer() {
+fn unicode_placeholder_versions_are_supported_conservatively() {
     let cases = [
         (
-            KittyCapabilities {
-                ansi_color_metadata: true,
-                multiplexer: false,
-                queried_terminal: Some(KittyGraphicsTerminal::Kitty {
-                    version: (0, 28, 0),
-                }),
+            KittyGraphicsTerminal::Kitty {
+                version: (0, 28, 0),
             },
             true,
         ),
         (
-            KittyCapabilities {
-                ansi_color_metadata: true,
-                multiplexer: false,
-                queried_terminal: Some(KittyGraphicsTerminal::Kitty {
-                    version: (0, 27, 1),
-                }),
+            KittyGraphicsTerminal::Kitty {
+                version: (0, 27, 1),
             },
             false,
         ),
+        (KittyGraphicsTerminal::Ghostty { version: (1, 3, 1) }, true),
         (
-            KittyCapabilities {
-                ansi_color_metadata: true,
-                multiplexer: false,
-                queried_terminal: Some(KittyGraphicsTerminal::Ghostty { version: (1, 3, 1) }),
-            },
-            true,
-        ),
-        (
-            KittyCapabilities {
-                ansi_color_metadata: true,
-                multiplexer: false,
-                queried_terminal: Some(KittyGraphicsTerminal::Ghostty {
-                    version: (0, 99, 0),
-                }),
-            },
-            false,
-        ),
-        (KittyCapabilities::default(), false),
-        (
-            KittyCapabilities {
-                ansi_color_metadata: true,
-                multiplexer: true,
-                queried_terminal: Some(KittyGraphicsTerminal::Kitty {
-                    version: (0, 48, 1),
-                }),
-            },
-            false,
-        ),
-        (
-            KittyCapabilities {
-                ansi_color_metadata: false,
-                multiplexer: false,
-                queried_terminal: Some(KittyGraphicsTerminal::Kitty {
-                    version: (0, 48, 1),
-                }),
+            KittyGraphicsTerminal::Ghostty {
+                version: (0, 99, 0),
             },
             false,
         ),
     ];
 
-    for (capabilities, expected) in cases {
-        assert_eq!(
-            kitty_unicode_placeholders_supported_for_terminal(capabilities),
-            expected,
-        );
+    for (terminal, expected) in cases {
+        assert_eq!(terminal.unicode_placeholders_supported(), expected);
     }
 }
 

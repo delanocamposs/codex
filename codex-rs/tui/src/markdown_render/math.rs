@@ -42,7 +42,8 @@ pub(crate) fn render_markdown_lines(
     if prepared_inline_math.renders_literal() {
         return render_literal_lines(input, width);
     }
-    let (markdown, inline_math_mask, inline_math_spans) = prepared_inline_math.into_parts();
+    let (markdown, inline_math_mask, inline_math_spans, display_math) =
+        prepared_inline_math.into_parts();
     let parser =
         DecodedTextMerge::new(Parser::new_ext(&markdown, parser_options).into_offset_iter());
     let mut writer = Writer::new(
@@ -54,7 +55,9 @@ pub(crate) fn render_markdown_lines(
         InlineMathCursor::new(input, inline_math_mask, inline_math_spans),
     );
     writer.latex_renderer = latex_renderer.map(|renderer| renderer.for_render_pass());
-    writer.run();
+    if !writer.run(display_math) {
+        return render_literal_lines(input, width);
+    }
     writer.text
 }
 
@@ -78,19 +81,31 @@ impl<'a, 'policy, I> Writer<'a, 'policy, I>
 where
     I: Iterator<Item = (Event<'a>, Range<usize>)>,
 {
-    pub(super) fn run(&mut self) {
-        let mut display_math_extractor = crate::display_math::DisplayMathExtractor::new(self.input);
+    pub(super) fn run(
+        &mut self,
+        display_math: Vec<crate::display_math::DisplayMathSpan<'a>>,
+    ) -> bool {
+        let mut display_math = display_math.into_iter().peekable();
         while let Some((event, range)) = self.iter.next() {
-            if let Some(block) = display_math_extractor.inspect(&event, range.clone()) {
-                let raw_block = block.raw_block.to_string();
-                let formula = block.formula.to_string();
-                for (paragraph_event, paragraph_range) in self.iter.by_ref() {
-                    display_math_extractor.inspect(&paragraph_event, paragraph_range);
+            let is_display_math = matches!(&event, Event::Start(pulldown_cmark::Tag::Paragraph))
+                && display_math.peek().is_some_and(|span| {
+                    range.start <= span.source_range.start
+                        && span.source_range.end <= range.end
+                        && self
+                            .input
+                            .get(range.clone())
+                            .is_some_and(|paragraph| paragraph.trim() == span.raw_block)
+                });
+            if is_display_math {
+                let span = display_math
+                    .next()
+                    .expect("the display-math span was just validated");
+                for (paragraph_event, _) in self.iter.by_ref() {
                     if matches!(paragraph_event, Event::End(TagEnd::Paragraph)) {
                         break;
                     }
                 }
-                self.display_math_block(&raw_block, &formula);
+                self.display_math_block(span.raw_block, span.formula);
                 continue;
             }
             self.handle_event(event, range);
@@ -100,6 +115,7 @@ where
             "every inline-math source span must be consumed"
         );
         self.flush_current_line();
+        display_math.next().is_none()
     }
 
     fn display_math_block(&mut self, raw_block: &str, formula: &str) {

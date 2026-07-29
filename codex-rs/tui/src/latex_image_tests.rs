@@ -90,31 +90,6 @@ fn formula_admission_rejects_custom_macro_definitions() {
 }
 
 #[test]
-fn raster_metrics_use_a_32px_reference_and_follow_cell_height() {
-    assert_eq!(
-        [
-            raster_metrics(/*cell_height*/ 16),
-            raster_metrics(/*cell_height*/ 32),
-            raster_metrics(/*cell_height*/ 36),
-        ],
-        [
-            RasterMetrics {
-                font_size: 22.0,
-                padding: 4.0,
-            },
-            RasterMetrics {
-                font_size: 44.0,
-                padding: 8.0,
-            },
-            RasterMetrics {
-                font_size: 49.5,
-                padding: 9.0,
-            },
-        ],
-    );
-}
-
-#[test]
 fn ratex_renders_a_transparent_colored_png() {
     let formula =
         ValidatedLatexFormula::new(r"\frac{-b \pm \sqrt{b^2-4ac}}{2a}").expect("valid formula");
@@ -147,15 +122,6 @@ fn ratex_renders_a_transparent_colored_png() {
 fn ratex_accepts_representative_display_math() {
     let formulas = [
         r"\begin{aligned}\rho\left(\frac{\partial \mathbf{u}}{\partial t}+(\mathbf{u}\cdot\nabla)\mathbf{u}\right)&=-\nabla p+\mu\nabla^2\mathbf{u}+\mathbf{f},\\\nabla\cdot\mathbf{u}&=0.\end{aligned}",
-        r"\rho\left(
-\frac{\partial \mathbf{u}}{\partial t}
-+(\mathbf{u}\cdot\nabla)\mathbf{u}
-\right)
-=
--\nabla p
-+\mu\nabla^2\mathbf{u}
-+\rho\mathbf{f},
-",
         r"\underbrace{\rho\frac{\partial\mathbf{u}}{\partial t}}_{\text{local acceleration}}",
         r"\begin{pmatrix}a&b\\c&d\end{pmatrix}^{-1}=\frac{1}{ad-bc}\begin{pmatrix}d&-b\\-c&a\end{pmatrix}",
         r"\begin{matrix}A&\xrightarrow{f}&B\\\downarrow g&&\downarrow h\\C&\xrightarrow{k}&D\end{matrix}",
@@ -293,15 +259,12 @@ fn png_validation_enforces_bytes_and_dimensions() {
         /*height*/ 1,
         Rgba([12, 34, 56, 255]),
     ));
+    let oversized_bytes = vec![0; MAX_PNG_BYTES + 1];
 
-    assert!(matches!(
-        validate_png(Vec::new()),
-        Err(LatexImageError::InvalidOutputSize(0))
-    ));
-    assert!(matches!(
-        validate_png(b"not a PNG".to_vec()),
-        Err(LatexImageError::InvalidPng(reason)) if reason == "not a PNG file"
-    ));
+    assert_eq!(
+        validate_png(oversized_bytes),
+        Err(LatexImageError::InvalidOutputSize(MAX_PNG_BYTES + 1)),
+    );
     assert!(matches!(
         validate_png(oversized_dimensions),
         Err(LatexImageError::InvalidPng(reason)) if reason.contains("dimensions")

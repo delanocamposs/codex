@@ -302,11 +302,8 @@ fn validate_display_list_dimensions(
 
 #[cfg(unix)]
 fn validate_png(bytes: Vec<u8>) -> Result<LatexPng, LatexImageError> {
-    if bytes.is_empty() || bytes.len() > MAX_PNG_BYTES {
+    if bytes.len() > MAX_PNG_BYTES {
         return Err(LatexImageError::InvalidOutputSize(bytes.len()));
-    }
-    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        return Err(LatexImageError::InvalidPng("not a PNG file".into()));
     }
     let (width, height) = ImageReader::with_format(Cursor::new(&bytes), ImageFormat::Png)
         .into_dimensions()

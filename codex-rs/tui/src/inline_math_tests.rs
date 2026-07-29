@@ -7,7 +7,7 @@ use super::*;
 type PreparedParts = (String, Option<char>, Vec<InlineMathSpan>);
 
 fn prepared(source: &str) -> PreparedParts {
-    let (markdown, mask, spans) = PreparedInlineMath::new(source).into_parts();
+    let (markdown, mask, spans, _) = PreparedInlineMath::new(source).into_parts();
     (markdown.into_owned(), mask, spans)
 }
 
@@ -134,7 +134,7 @@ fn occupied_primary_masks_fall_back_to_another_absent_byte() {
     );
     let prepared = PreparedInlineMath::new(&source);
     assert!(prepared.contains_math());
-    let (_, mask, spans) = prepared.into_parts();
+    let (_, mask, spans, _) = prepared.into_parts();
 
     assert_eq!(spans[0].raw, r"\(x\)");
     assert!(
@@ -153,7 +153,7 @@ fn exhausted_control_masks_disable_math_rendering() {
     let prepared = PreparedInlineMath::new(&source);
 
     assert!(prepared.renders_literal());
-    let (markdown, mask, spans) = prepared.into_parts();
+    let (markdown, mask, spans, _) = prepared.into_parts();
     assert_eq!(&*markdown, source);
     assert_eq!((mask, spans), (None, Vec::new()));
 }
@@ -180,7 +180,7 @@ fn long_pending_display_math_keeps_exact_source_and_carries_its_start() {
 
     assert_eq!(prepared.pending_display_math_start(), Some(prefix.len()),);
     assert!(!prepared.contains_math());
-    let (markdown, mask, spans) = prepared.into_parts();
+    let (markdown, mask, spans, _) = prepared.into_parts();
     assert_eq!(&*markdown, source);
     assert_eq!((mask, spans), (None, Vec::new()));
 }

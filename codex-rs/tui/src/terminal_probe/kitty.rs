@@ -2,31 +2,28 @@
 
 use std::env;
 
+use codex_terminal_detection::TerminalName;
+use codex_terminal_detection::terminal_info;
+
 use crate::terminal_image::KittyGraphicsTerminal;
-use crate::terminal_image::MULTIPLEXER_ENV_VARS;
+use crate::terminal_image::multiplexer_environment_present;
 
 const XTVERSION_QUERY: &[u8] = b"\x1B[>0q";
 
 /// State for the optional Kitty version query during the batched startup probe.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct StartupVersionProbe {
-    should_query: bool,
-    terminal: Option<KittyGraphicsTerminal>,
+pub(super) enum StartupVersionProbe {
+    Skip,
+    Query(Option<KittyGraphicsTerminal>),
 }
 
 impl StartupVersionProbe {
     pub(super) const fn query() -> Self {
-        Self {
-            should_query: true,
-            terminal: None,
-        }
+        Self::Query(None)
     }
 
     const fn skip() -> Self {
-        Self {
-            should_query: false,
-            terminal: None,
-        }
+        Self::Skip
     }
 
     /// Returns the XTVERSION query to prepend to the rest of the startup query batch.
@@ -34,74 +31,43 @@ impl StartupVersionProbe {
     /// Requiring its reply before early completion prevents a split or reordered DCS reply from
     /// leaking into crossterm. The shared startup deadline remains the bounded fallback.
     pub(super) fn query_bytes(self) -> &'static [u8] {
-        if self.should_query {
-            XTVERSION_QUERY
-        } else {
-            b""
+        match self {
+            Self::Skip => b"",
+            Self::Query(_) => XTVERSION_QUERY,
         }
     }
 
     pub(super) fn observe(&mut self, buffer: &[u8]) {
-        if self.terminal.is_none() {
-            self.terminal = parse_terminal(buffer);
+        if let Self::Query(terminal @ None) = self {
+            *terminal = parse_terminal(buffer);
         }
     }
 
     pub(super) fn is_complete(self) -> bool {
-        !self.should_query || self.terminal.is_some()
+        matches!(self, Self::Skip | Self::Query(Some(_)))
     }
 
     pub(super) fn terminal(self) -> Option<KittyGraphicsTerminal> {
-        self.terminal
+        match self {
+            Self::Skip => None,
+            Self::Query(terminal) => terminal,
+        }
     }
-}
-
-#[derive(Clone, Copy, Default)]
-struct StartupVersionProbeEnvironment {
-    no_color: bool,
-    multiplexer: bool,
-    kitty_window_id: bool,
-    kitty_term: bool,
-    kitty_term_program: bool,
-    ghostty_term: bool,
-    ghostty_term_program: bool,
 }
 
 pub(super) fn startup_version_probe() -> StartupVersionProbe {
-    startup_version_probe_for(StartupVersionProbeEnvironment {
-        no_color: env::var_os("NO_COLOR").is_some(),
-        multiplexer: MULTIPLEXER_ENV_VARS
-            .into_iter()
-            .any(|name| env::var_os(name).is_some()),
-        kitty_window_id: env::var_os("KITTY_WINDOW_ID").is_some(),
-        kitty_term: env::var_os("TERM").is_some_and(|value| {
-            value
-                .to_string_lossy()
-                .to_ascii_lowercase()
-                .contains("kitty")
-        }),
-        kitty_term_program: env::var_os("TERM_PROGRAM")
-            .is_some_and(|value| value.to_string_lossy().eq_ignore_ascii_case("kitty")),
-        ghostty_term: env::var_os("TERM").is_some_and(|value| {
-            value
-                .to_string_lossy()
-                .to_ascii_lowercase()
-                .contains("ghostty")
-        }),
-        ghostty_term_program: env::var_os("TERM_PROGRAM")
-            .is_some_and(|value| value.to_string_lossy().eq_ignore_ascii_case("ghostty")),
-    })
-}
-
-fn startup_version_probe_for(environment: StartupVersionProbeEnvironment) -> StartupVersionProbe {
-    if environment.no_color || environment.multiplexer {
+    if env::var_os("NO_COLOR").is_some() || multiplexer_environment_present() {
         return StartupVersionProbe::skip();
     }
-    if environment.kitty_window_id
-        || environment.kitty_term
-        || environment.kitty_term_program
-        || environment.ghostty_term
-        || environment.ghostty_term_program
+
+    let info = terminal_info();
+    let terminal_hint = env::var_os("TERM").is_some_and(|value| {
+        let value = value.to_string_lossy().to_ascii_lowercase();
+        value.contains("kitty") || value.contains("ghostty")
+    });
+    if matches!(info.name, TerminalName::Kitty | TerminalName::Ghostty)
+        || env::var_os("KITTY_WINDOW_ID").is_some()
+        || terminal_hint
     {
         StartupVersionProbe::query()
     } else {

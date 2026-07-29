@@ -7,25 +7,24 @@ use pulldown_cmark::Tag;
 use std::borrow::Cow;
 use std::ops::Range;
 
-/// A display-math block backed by the original Markdown source.
+/// An accepted display-math block backed by ranges in the original Markdown source.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DisplayMathBlock<'a> {
-    /// The exact, whitespace-trimmed source block, including its delimiters.
+pub(crate) struct DisplayMathSpan<'a> {
+    pub(crate) source_range: Range<usize>,
     pub(crate) raw_block: &'a str,
-    /// The exact source between the opening and closing delimiters.
     pub(crate) formula: &'a str,
 }
 
 /// Markdown with the contents of lexical display-math candidates neutralized.
 ///
 /// CommonMark can otherwise interpret TeX lines as Markdown structure before
-/// [`DisplayMathExtractor`] sees them. In particular, a formula line containing only `=` turns
-/// the preceding line into a Setext heading. A parse of the unmodified source first excludes
-/// candidates in lists, block quotes, code blocks, tables, and HTML. A masked discovery parse then
-/// accepts complete top-level paragraphs, and only those formulas remain masked in the result.
+/// the final renderer sees them. In particular, a formula line containing only `=` turns the
+/// preceding line into a Setext heading. A parse of the unmodified source first excludes candidates
+/// in lists, block quotes, code blocks, tables, and HTML. A masked discovery parse then accepts
+/// complete top-level paragraphs, and only those formulas remain masked in the result.
 pub(crate) struct PreparedDisplayMath<'a> {
     markdown: Cow<'a, str>,
-    source_ranges: Vec<Range<usize>>,
+    spans: Vec<DisplayMathSpan<'a>>,
     pending_start: Option<usize>,
 }
 
@@ -37,7 +36,7 @@ impl<'a> PreparedDisplayMath<'a> {
             .and_then(|candidate| pending_display_math_start(source, candidate, mask));
         let unchanged = || Self {
             markdown: Cow::Borrowed(source),
-            source_ranges: Vec::new(),
+            spans: Vec::new(),
             pending_start,
         };
         if candidates.is_empty() {
@@ -60,71 +59,27 @@ impl<'a> PreparedDisplayMath<'a> {
         }
 
         let mut markdown = source.as_bytes().to_vec();
-        let source_ranges = accepted
-            .iter()
-            .map(|candidate| candidate.block_range.clone())
-            .collect();
+        let mut spans = Vec::with_capacity(accepted.len());
         for candidate in accepted {
             mask_formula(&mut markdown, candidate.formula_range.clone(), mask);
+            spans.push(DisplayMathSpan {
+                source_range: candidate.block_range.clone(),
+                raw_block: &source[candidate.block_range.clone()],
+                formula: &source[candidate.formula_range.clone()],
+            });
         }
         Self {
             markdown: Cow::Owned(
                 String::from_utf8(markdown)
                     .expect("ASCII display-math masking must preserve valid UTF-8"),
             ),
-            source_ranges,
+            spans,
             pending_start,
         }
     }
 
-    pub(crate) fn into_parts(self) -> (Cow<'a, str>, Vec<Range<usize>>, Option<usize>) {
-        (self.markdown, self.source_ranges, self.pending_start)
-    }
-}
-
-/// Observes a complete pulldown-cmark event stream and recognizes display math.
-///
-/// Call [`Self::inspect`] exactly once for every event, in order. The observer
-/// uses the nesting of those events to reject paragraphs inside Markdown
-/// containers such as lists and block quotes.
-pub(crate) struct DisplayMathExtractor<'a> {
-    source: &'a str,
-    depth: usize,
-}
-
-impl<'a> DisplayMathExtractor<'a> {
-    pub(crate) fn new(source: &'a str) -> Self {
-        Self { source, depth: 0 }
-    }
-
-    /// Inspects one event from an offset iterator.
-    ///
-    /// Returns a block only when this event starts a top-level paragraph whose
-    /// entire trimmed source is one nonempty `$$...$$` or `\[...\]` block.
-    pub(crate) fn inspect(
-        &mut self,
-        event: &Event<'_>,
-        source_range: Range<usize>,
-    ) -> Option<DisplayMathBlock<'a>> {
-        let block = if self.depth == 0 && matches!(event, Event::Start(Tag::Paragraph)) {
-            parse_display_math_paragraph(self.source, source_range)
-        } else {
-            None
-        };
-
-        match event {
-            Event::Start(_) => self.depth += 1,
-            Event::End(_) => {
-                debug_assert_ne!(
-                    self.depth, 0,
-                    "display-math extractor observed an unbalanced end event"
-                );
-                self.depth = self.depth.saturating_sub(1);
-            }
-            _ => {}
-        }
-
-        block
+    pub(crate) fn into_parts(self) -> (Cow<'a, str>, Vec<DisplayMathSpan<'a>>, Option<usize>) {
+        (self.markdown, self.spans, self.pending_start)
     }
 }
 
@@ -344,16 +299,25 @@ fn accepted_display_math_candidates<'a>(
     markdown: &str,
     candidates: &[&'a DisplayMathCandidate],
 ) -> Vec<&'a DisplayMathCandidate> {
-    let mut extractor = DisplayMathExtractor::new(source);
     let mut accepted = Vec::new();
+    let mut depth = 0usize;
 
     for (event, range) in Parser::new_ext(markdown, markdown_options()).into_offset_iter() {
-        if extractor.inspect(&event, range.clone()).is_some()
+        if depth == 0
+            && matches!(&event, Event::Start(Tag::Paragraph))
             && let Some(candidate) = candidates.iter().copied().find(|candidate| {
-                range.start <= candidate.block_range.start && candidate.block_range.end <= range.end
+                range.start <= candidate.block_range.start
+                    && candidate.block_range.end <= range.end
+                    && source[range.clone()].trim() == &source[candidate.block_range.clone()]
             })
+            && !contains_html(&source[candidate.block_range.clone()])
         {
             accepted.push(candidate);
+        }
+        match event {
+            Event::Start(_) => depth += 1,
+            Event::End(_) => depth = depth.saturating_sub(1),
+            _ => {}
         }
     }
 
@@ -404,39 +368,6 @@ fn display_delimiters(line: &str) -> Option<(&'static str, &'static str)> {
     } else {
         None
     }
-}
-
-fn parse_display_math_paragraph(
-    source: &str,
-    paragraph_range: Range<usize>,
-) -> Option<DisplayMathBlock<'_>> {
-    let paragraph = source.get(paragraph_range)?;
-    let raw_block = paragraph.trim();
-    let formula = if let Some(formula) = raw_block
-        .strip_prefix("$$")
-        .and_then(|body| body.strip_suffix("$$"))
-    {
-        if formula.contains("$$") {
-            return None;
-        }
-        formula
-    } else if let Some(formula) = raw_block
-        .strip_prefix(r"\[")
-        .and_then(|body| body.strip_suffix(r"\]"))
-    {
-        if formula.contains(r"\[") || formula.contains(r"\]") {
-            return None;
-        }
-        formula
-    } else {
-        return None;
-    };
-
-    if formula.trim().is_empty() || contains_html(raw_block) {
-        return None;
-    }
-
-    Some(DisplayMathBlock { raw_block, formula })
 }
 
 fn contains_html(markdown: &str) -> bool {

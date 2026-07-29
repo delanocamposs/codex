@@ -39,17 +39,19 @@ pub(crate) fn render_streaming_markdown_lines_with_width_and_cwd(
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TABLES);
+    let render_literal = || StreamingMarkdownRender {
+        lines: super::math::render_literal_lines(input, width),
+        last_top_level_block_start: None,
+        has_reference_link_definition: false,
+        first_top_level_block_is_html: false,
+    };
     let prepared_inline_math = crate::inline_math::PreparedInlineMath::new(input);
     if prepared_inline_math.renders_literal() {
-        return StreamingMarkdownRender {
-            lines: super::math::render_literal_lines(input, width),
-            last_top_level_block_start: None,
-            has_reference_link_definition: false,
-            first_top_level_block_is_html: false,
-        };
+        return render_literal();
     }
     let pending_display_math_start = prepared_inline_math.pending_display_math_start();
-    let (markdown, inline_math_mask, inline_math_spans) = prepared_inline_math.into_parts();
+    let (markdown, inline_math_mask, inline_math_spans, display_math) =
+        prepared_inline_math.into_parts();
     let parser = Parser::new_ext(&markdown, options);
     let has_reference_link_definition = parser.reference_definitions().iter().next().is_some();
     let parser = TopLevelBlockTracker {
@@ -67,7 +69,9 @@ pub(crate) fn render_streaming_markdown_lines_with_width_and_cwd(
         &never_hide_link_destination,
         InlineMathCursor::new(input, inline_math_mask, inline_math_spans),
     );
-    writer.run();
+    if !writer.run(display_math) {
+        return render_literal();
+    }
     let mut last_top_level_block_start =
         (writer.iter.block_count > 1).then_some(writer.iter.last_start);
     if let Some(pending_math_start) = pending_display_math_start {

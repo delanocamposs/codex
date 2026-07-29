@@ -1,15 +1,12 @@
 use super::*;
 use pretty_assertions::assert_eq;
-use pulldown_cmark::Options;
 
 fn extract(markdown: &str) -> Vec<(&str, &str)> {
     let prepared = PreparedDisplayMath::new(markdown, b'\x01');
-    let (parser_input, _, _) = prepared.into_parts();
-    let mut extractor = DisplayMathExtractor::new(markdown);
-    Parser::new_ext(&parser_input, Options::ENABLE_TABLES)
-        .into_offset_iter()
-        .filter_map(|(event, range)| extractor.inspect(&event, range))
-        .map(|block| (block.raw_block, block.formula))
+    let (_, spans, _) = prepared.into_parts();
+    spans
+        .iter()
+        .map(|span| (span.raw_block, span.formula))
         .collect()
 }
 
@@ -21,10 +18,10 @@ fn preparation_leaves_rejected_candidates_exact() {
         "- item\n\n  \\[\n  listed\n  \\]",
         "equation |\n--- |\n$$table$$",
     ] {
-        let (prepared, source_ranges, _) = PreparedDisplayMath::new(source, b'\x01').into_parts();
+        let (prepared, spans, _) = PreparedDisplayMath::new(source, b'\x01').into_parts();
 
         assert_eq!(&*prepared, source, "{source:?}");
-        assert!(source_ranges.is_empty(), "{source:?}");
+        assert!(spans.is_empty(), "{source:?}");
     }
 }
 
@@ -37,7 +34,7 @@ fn preparation_masks_a_setext_like_formula_after_rejected_candidates() {
         "equation |\n--- |\n$$table$$\n\n",
         "\\[\na\n=\nb\n\\]",
     );
-    let (prepared, source_ranges, _) = PreparedDisplayMath::new(source, b'\x01').into_parts();
+    let (prepared, spans, _) = PreparedDisplayMath::new(source, b'\x01').into_parts();
 
     assert_eq!(
         &*prepared,
@@ -52,9 +49,10 @@ fn preparation_masks_a_setext_like_formula_after_rejected_candidates() {
     let expected_start = source
         .find("\\[\na\n=\nb\n\\]")
         .expect("fixture contains display math");
+    assert_eq!(spans.len(), 1);
     assert_eq!(
-        source_ranges,
-        vec![expected_start..expected_start + "\\[\na\n=\nb\n\\]".len()]
+        &spans[0].source_range,
+        &(expected_start..expected_start + "\\[\na\n=\nb\n\\]".len())
     );
 }
 
@@ -79,11 +77,11 @@ fn preparation_carries_pending_structural_start_without_changing_source() {
         ("    $$\nx", None),
         ("$$x", None),
     ] {
-        let (prepared, source_ranges, pending_start) =
+        let (prepared, spans, pending_start) =
             PreparedDisplayMath::new(source, b'\x01').into_parts();
 
         assert_eq!(&*prepared, source, "{source:?}");
-        assert!(source_ranges.is_empty(), "{source:?}");
+        assert!(spans.is_empty(), "{source:?}");
         assert_eq!(pending_start, expected_start, "{source:?}");
     }
 }
