@@ -163,6 +163,9 @@ impl App {
     }
 
     pub(super) fn reset_transcript_state_after_clear(&mut self) {
+        if let Some(renderer) = self.latex_renderer.as_mut() {
+            renderer.reset();
+        }
         self.overlay = None;
         self.transcript_cells.clear();
         self.deferred_history_lines.clear();

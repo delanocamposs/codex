@@ -2,6 +2,7 @@
 
 #[path = "tests/advanced_reasoning_tests.rs"]
 mod advanced_reasoning_tests;
+mod display_math;
 mod model_catalog;
 mod plugin_catalog;
 mod rate_limits;
@@ -1912,6 +1913,7 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
             &mut tui,
             resumed,
             crate::app::session_lifecycle::ThreadAttachPresentation::SessionLineage,
+            crate::app::session_lifecycle::ThreadUiReset::Required,
             /*initial_user_message*/ None,
         )
         .await?;
@@ -4733,6 +4735,7 @@ async fn make_test_app() -> App {
         runtime_permission_profile_override: None,
         file_search,
         transcript_cells: Vec::new(),
+        latex_renderer: None,
         overlay: None,
         deferred_history_lines: Vec::new(),
         has_emitted_history_lines: false,
@@ -4801,6 +4804,7 @@ async fn make_test_app_with_channels() -> (
             runtime_permission_profile_override: None,
             file_search,
             transcript_cells: Vec::new(),
+            latex_renderer: None,
             overlay: None,
             deferred_history_lines: Vec::new(),
             has_emitted_history_lines: false,

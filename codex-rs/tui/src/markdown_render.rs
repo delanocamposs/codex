@@ -42,18 +42,16 @@
 use crate::markdown_text_merge::DecodedTextMerge;
 use crate::render::highlight::foreground_style_for_scopes;
 use crate::render::highlight::highlight_code_to_lines;
-use crate::render::line_utils::line_to_static;
 use crate::style::table_separator_style;
 use crate::terminal_hyperlinks::HyperlinkLine;
+use crate::terminal_hyperlinks::adaptive_wrap_hyperlink_line;
 use crate::terminal_hyperlinks::annotate_web_urls_in_line;
-use crate::terminal_hyperlinks::remap_wrapped_line;
 use crate::terminal_hyperlinks::visible_lines;
 use crate::terminal_hyperlinks::web_destination;
+use crate::terminal_hyperlinks::word_wrap_hyperlink_line;
 use crate::width::char_width;
 use crate::width::display_width;
 use crate::wrapping::RtOptions;
-use crate::wrapping::adaptive_wrap_line;
-use crate::wrapping::word_wrap_line;
 use codex_utils_string::normalize_markdown_hash_location_suffix;
 use dirs::home_dir;
 use pulldown_cmark::Alignment;
@@ -76,9 +74,15 @@ use std::path::PathBuf;
 use std::sync::LazyLock;
 use url::Url;
 
+mod inline_math;
+mod math;
 mod streaming;
 mod table_key_value;
 
+use inline_math::InlineMathCursor;
+
+pub(crate) use math::MarkdownRenderOptions;
+pub(crate) use math::render_markdown_lines;
 pub(crate) use streaming::StreamingMarkdownRender;
 pub(crate) use streaming::render_streaming_markdown_lines_with_width_and_cwd;
 
@@ -169,16 +173,10 @@ impl TableCell {
         }
     }
 
-    fn push_annotated(&mut self, mut appended: HyperlinkLine) {
+    fn push_annotated(&mut self, appended: HyperlinkLine) {
         self.ensure_line();
         if let Some(line) = self.lines.last_mut() {
-            let shift = line.width();
-            line.line.spans.append(&mut appended.line.spans);
-            line.hyperlinks
-                .extend(appended.hyperlinks.into_iter().map(|mut link| {
-                    link.columns = link.columns.start + shift..link.columns.end + shift;
-                    link
-                }));
+            line.append_annotated(appended);
         }
     }
 
@@ -341,13 +339,15 @@ pub(crate) fn render_markdown_lines_with_width_cwd_and_hidden_link_destinations(
     cwd: Option<&Path>,
     is_hidden_link_destination: &dyn Fn(&str) -> bool,
 ) -> Vec<HyperlinkLine> {
-    let mut options = Options::empty();
-    options.insert(Options::ENABLE_STRIKETHROUGH);
-    options.insert(Options::ENABLE_TABLES);
-    let parser = DecodedTextMerge::new(Parser::new_ext(input, options).into_offset_iter());
-    let mut w = Writer::new(input, parser, width, cwd, is_hidden_link_destination);
-    w.run();
-    w.text
+    render_markdown_lines(
+        input,
+        MarkdownRenderOptions {
+            width,
+            cwd,
+            is_hidden_link_destination,
+            latex_renderer: None,
+        },
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -418,6 +418,8 @@ where
     current_line_style: Style,
     current_line_in_code_block: bool,
     table_state: Option<TableState>,
+    latex_renderer: Option<crate::latex_renderer::LatexRenderHandle>,
+    inline_math: InlineMathCursor<'a>,
 }
 
 impl<'a, 'policy, I> Writer<'a, 'policy, I>
@@ -430,6 +432,7 @@ where
         wrap_width: Option<usize>,
         cwd: Option<&Path>,
         is_hidden_link_destination: &'policy dyn Fn(&str) -> bool,
+        inline_math: InlineMathCursor<'a>,
     ) -> Self {
         Self {
             input,
@@ -459,14 +462,9 @@ where
             current_line_style: Style::default(),
             current_line_in_code_block: false,
             table_state: None,
+            latex_renderer: None,
+            inline_math,
         }
-    }
-
-    fn run(&mut self) {
-        while let Some((ev, range)) = self.iter.next() {
-            self.handle_event(ev, range);
-        }
-        self.flush_current_line();
     }
 
     fn handle_event(&mut self, event: Event<'a>, range: Range<usize>) {
@@ -474,7 +472,7 @@ where
         match event {
             Event::Start(tag) => self.start_tag(tag, range),
             Event::End(tag) => self.end_tag(tag),
-            Event::Text(text) => self.text(text),
+            Event::Text(text) => self.text(text, range),
             Event::Code(code) => self.code(code),
             Event::SoftBreak => self.soft_break(),
             Event::HardBreak => self.hard_break(),
@@ -648,13 +646,14 @@ where
         self.needs_newline = true;
     }
 
-    fn text(&mut self, text: CowStr<'a>) {
+    fn text(&mut self, text: CowStr<'a>, source_range: Range<usize>) {
         if self.suppressing_local_link_label() {
+            self.discard_inline_math(&text, source_range);
             return;
         }
         self.line_ends_with_local_link_target = false;
         if self.in_table_cell() {
-            self.push_text_to_table_cell(&text);
+            self.push_text_with_inline_math(&text, source_range);
             return;
         }
 
@@ -687,18 +686,7 @@ where
                 self.push_line(Line::default());
             }
         }
-        for (i, line) in text.lines().enumerate() {
-            if self.needs_newline {
-                self.push_line(Line::default());
-                self.needs_newline = false;
-            }
-            if i > 0 {
-                self.push_line(Line::default());
-            }
-            let content = line.to_string();
-            let style = self.inline_styles.last().copied().unwrap_or_default();
-            self.push_text_spans(&content, style);
-        }
+        self.push_text_with_inline_math(&text, source_range);
         self.needs_newline = false;
     }
 
@@ -1156,7 +1144,9 @@ where
             };
         };
 
-        if table_key_value::should_render_records(&rows, &column_widths, &metrics) {
+        if table_key_value::should_render_records(&rows, &column_widths, &metrics)
+            || Self::table_has_image_wider_than(&header, &rows, &column_widths)
+        {
             return RenderedTableLines {
                 table_lines: table_key_value::render_records(
                     &header,
@@ -1208,6 +1198,24 @@ where
     fn normalize_row(row: &mut Vec<TableCell>, column_count: usize) {
         row.truncate(column_count);
         row.resize(column_count, TableCell::default());
+    }
+
+    fn table_has_image_wider_than(
+        header: &[TableCell],
+        rows: &[Vec<TableCell>],
+        column_widths: &[usize],
+    ) -> bool {
+        std::iter::once(header)
+            .chain(rows.iter().map(Vec::as_slice))
+            .any(|row| {
+                row.iter().zip(column_widths).any(|(cell, width)| {
+                    cell.lines.iter().any(|line| {
+                        line.kitty_images
+                            .iter()
+                            .any(|image| image.columns.len() > *width)
+                    })
+                })
+            })
     }
 
     /// Subtract horizontal gutters and per-cell padding from the content budget.
@@ -1539,6 +1547,13 @@ where
                                 ..link.columns.end + column_start + left_padding;
                             link
                         }));
+                    out_line
+                        .kitty_images
+                        .extend(line.kitty_images.iter().cloned().map(|mut image| {
+                            image.columns = image.columns.start + column_start + left_padding
+                                ..image.columns.end + column_start + left_padding;
+                            image
+                        }));
                 }
                 column_start += *width + TABLE_CELL_PADDING + TABLE_COLUMN_GAP;
             }
@@ -1582,38 +1597,42 @@ where
                     .iter()
                     .map(|span| span.content.as_ref())
                     .collect::<String>();
-                let mut column = 0usize;
-                let mut current_destination = None;
-                let mut current_text = String::new();
-                let flush = |out: &mut HyperlinkLine,
-                             current_text: &mut String,
-                             destination: Option<&str>| {
-                    if !current_text.is_empty() {
-                        out.push_span(Span::raw(std::mem::take(current_text)), destination);
-                    }
-                };
-                for ch in text.chars() {
-                    let destination = line
-                        .hyperlinks
-                        .iter()
-                        .find(|link| link.columns.contains(&column))
-                        .map(|link| link.destination.as_str());
-                    if destination != current_destination {
-                        flush(&mut out, &mut current_text, current_destination);
-                        current_destination = destination;
-                    }
-                    if ch == '|' {
-                        current_text.push_str("\\|");
-                    } else {
-                        current_text.push(ch);
-                    }
-                    column += char_width(ch);
+                let shift = out.width();
+                for span in &line.line.spans {
+                    out.line
+                        .push_span(Span::styled(span.content.replace('|', "\\|"), span.style));
                 }
-                flush(&mut out, &mut current_text, current_destination);
+                out.hyperlinks
+                    .extend(line.hyperlinks.iter().cloned().map(|mut link| {
+                        link.columns = shift + Self::escaped_pipe_column(&text, link.columns.start)
+                            ..shift + Self::escaped_pipe_column(&text, link.columns.end);
+                        link
+                    }));
+                out.kitty_images
+                    .extend(line.kitty_images.iter().cloned().map(|mut image| {
+                        image.columns = shift
+                            + Self::escaped_pipe_column(&text, image.columns.start)
+                            ..shift + Self::escaped_pipe_column(&text, image.columns.end);
+                        image
+                    }));
             }
             out.push_span(" |".into(), /*destination*/ None);
         }
         out
+    }
+
+    fn escaped_pipe_column(text: &str, target_column: usize) -> usize {
+        let mut source_column = 0usize;
+        let mut escaped_column = 0usize;
+        for character in text.chars() {
+            if source_column >= target_column {
+                break;
+            }
+            let width = char_width(character);
+            source_column += width;
+            escaped_column += width + usize::from(character == '|');
+        }
+        escaped_column
     }
 
     fn alignments_to_pipe_delimiter(alignments: &[Alignment]) -> String {
@@ -1642,23 +1661,12 @@ where
         if cell.lines.is_empty() {
             return vec![HyperlinkLine::new(Line::default())];
         }
-        let mut wrapped = Vec::new();
-        for source_line in &cell.lines {
-            let rendered =
-                word_wrap_line(&source_line.line, RtOptions::new(width.max(/*other*/ 1)))
-                    .into_iter()
-                    .map(|line| line_to_static(&line))
-                    .collect::<Vec<_>>();
-            if rendered.is_empty() {
-                wrapped.push(HyperlinkLine::new(Line::default()));
-            } else {
-                wrapped.extend(remap_wrapped_line(source_line, rendered));
-            };
-        }
-        if wrapped.is_empty() {
-            wrapped.push(HyperlinkLine::new(Line::default()));
-        }
-        wrapped
+        cell.lines
+            .iter()
+            .flat_map(|source_line| {
+                word_wrap_hyperlink_line(source_line, RtOptions::new(width.max(/*other*/ 1)))
+            })
+            .collect()
     }
 
     /// Detect rows that are artifacts of pulldown-cmark's lenient table parsing.
@@ -1884,11 +1892,7 @@ where
                 let opts = RtOptions::new(width)
                     .initial_indent(self.current_initial_indent.clone().into())
                     .subsequent_indent(self.current_subsequent_indent.clone().into());
-                let wrapped = adaptive_wrap_line(&line.line, opts)
-                    .into_iter()
-                    .map(|wrapped| line_to_static(&wrapped))
-                    .collect();
-                for wrapped in remap_wrapped_line(&line, wrapped) {
+                for wrapped in adaptive_wrap_hyperlink_line(&line, opts) {
                     self.push_output_line(wrapped.style(style));
                 }
             } else {
@@ -1898,6 +1902,9 @@ where
                 for hyperlink in &mut line.hyperlinks {
                     hyperlink.columns =
                         hyperlink.columns.start + shift..hyperlink.columns.end + shift;
+                }
+                for image in &mut line.kitty_images {
+                    image.columns = image.columns.start + shift..image.columns.end + shift;
                 }
                 line.line = Line::from_iter(spans);
                 self.push_output_line(line.style(style));
@@ -1937,6 +1944,9 @@ where
         for hyperlink in &mut line.hyperlinks {
             hyperlink.columns = hyperlink.columns.start + shift..hyperlink.columns.end + shift;
         }
+        for image in &mut line.kitty_images {
+            image.columns = image.columns.start + shift..image.columns.end + shift;
+        }
         line.line = Line::from(spans);
         self.push_output_line(line.style(style));
     }
@@ -1963,9 +1973,11 @@ where
 
     fn push_hyperlink_line(&mut self, line: HyperlinkLine) {
         let hyperlinks = line.hyperlinks;
+        let kitty_images = line.kitty_images;
         self.push_line(line.line);
         if let Some(current) = self.current_line_content.as_mut() {
             current.hyperlinks = hyperlinks;
+            current.kitty_images = kitty_images;
         }
     }
 
@@ -1977,18 +1989,12 @@ where
         }
     }
 
-    fn push_annotated(&mut self, mut appended: HyperlinkLine) {
+    fn push_annotated(&mut self, appended: HyperlinkLine) {
         if self.current_line_content.is_none() {
             self.push_line(Line::default());
         }
         if let Some(line) = self.current_line_content.as_mut() {
-            let shift = line.width();
-            line.line.spans.append(&mut appended.line.spans);
-            line.hyperlinks
-                .extend(appended.hyperlinks.into_iter().map(|mut link| {
-                    link.columns = link.columns.start + shift..link.columns.end + shift;
-                    link
-                }));
+            line.append_annotated(appended);
         }
     }
 
@@ -2479,6 +2485,7 @@ mod tests {
             /*wrap_width*/ Some(80),
             /*cwd*/ None,
             &never_hide_link_destination,
+            InlineMathCursor::new("", /*mask*/ None, Vec::new()),
         );
         let wrapped = writer.wrap_cell(&cell, /*width*/ 40);
         let rendered = wrapped

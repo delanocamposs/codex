@@ -126,6 +126,11 @@ tokio-util = { workspace = true, features = ["time"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+ratex-font = { workspace = true }
+ratex-layout = { workspace = true }
+ratex-parser = { workspace = true }
+ratex-render = { workspace = true }
+ratex-types = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 which = { workspace = true }

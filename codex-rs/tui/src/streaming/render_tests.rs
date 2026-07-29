@@ -142,6 +142,42 @@ fn growing_single_top_level_blocks_render_and_scan_in_one_pass() {
 }
 
 #[test]
+fn incremental_inline_math_preserves_exact_source_after_closing_delimiter() {
+    let (source, render) = assert_rich_stream_matches_full_render(
+        &[r"Given \(x\in", r"\ker f''\), continue."],
+        Some(80),
+    );
+
+    assert_eq!(source, r"Given \(x\in\ker f''\), continue.");
+    assert_eq!(lines_to_plain_strings(&render.lines), vec![source],);
+}
+
+#[test]
+fn incomplete_display_math_with_setext_line_stays_mutable_until_close() {
+    let cwd = test_cwd();
+    let width = Some(80);
+    let mut source = String::new();
+    let mut render = StreamingRender::new();
+
+    append_rich_and_assert_matches_full(&mut render, &mut source, "Before.\n\n", width, &cwd);
+    let display_start = source.len();
+    for chunk in ["\\[\na\n", "=\n", "b\n"] {
+        append_rich_and_assert_matches_full(&mut render, &mut source, chunk, width, &cwd);
+        assert_eq!(
+            render.stable_source_len, display_start,
+            "after chunk {chunk:?}"
+        );
+    }
+
+    append_rich_and_assert_matches_full(&mut render, &mut source, "\\]\n", width, &cwd);
+    assert_eq!(render.stable_source_len, display_start);
+    let closed_display_len = source.len();
+
+    append_rich_and_assert_matches_full(&mut render, &mut source, "\nAfter.\n", width, &cwd);
+    assert!(render.stable_source_len >= closed_display_len);
+}
+
+#[test]
 fn incremental_raw_render_preserves_blank_lines() {
     let cwd = test_cwd();
     let width = Some(80);

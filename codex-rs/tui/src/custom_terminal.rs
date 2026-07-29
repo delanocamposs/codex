@@ -33,6 +33,7 @@ use crossterm::style::SetAttribute;
 use crossterm::style::SetBackgroundColor;
 use crossterm::style::SetColors;
 use crossterm::style::SetForegroundColor;
+use crossterm::style::SetUnderlineColor;
 use crossterm::terminal::Clear;
 use derive_more::IsVariant;
 use ratatui::backend::Backend;
@@ -47,6 +48,10 @@ use ratatui::layout::Size;
 use ratatui::style::Color;
 use ratatui::style::Modifier;
 use ratatui::widgets::WidgetRef;
+
+use crate::terminal_image::KittyImageRegistries;
+
+mod kitty_lifecycle;
 
 fn osc8_hyperlink_parts(symbol: &str) -> Option<(&str, &str)> {
     let content = symbol.strip_prefix("\x1b]8;;")?;
@@ -145,6 +150,8 @@ where
     pub last_known_cursor_pos: Position,
     /// Count of visible history rows rendered above the viewport in inline mode.
     visible_history_rows: u16,
+    /// Screen-local image definitions uploaded for placeholder-backed transcript rows.
+    kitty_image_registries: KittyImageRegistries,
     #[cfg(test)]
     screen_size_override: Option<Size>,
 }
@@ -224,6 +231,7 @@ where
             last_known_screen_size: screen_size,
             last_known_cursor_pos: cursor_pos,
             visible_history_rows: 0,
+            kitty_image_registries: KittyImageRegistries::default(),
             #[cfg(test)]
             screen_size_override: None,
         }
@@ -488,40 +496,6 @@ where
         self.previous_buffer_mut().reset();
     }
 
-    /// Clear the entire visible screen (not just the viewport) and force a full redraw.
-    pub fn clear_visible_screen(&mut self) -> io::Result<()> {
-        let home = Position { x: 0, y: 0 };
-        // Some terminals (notably Terminal.app) behave more reliably if we pair ED2
-        // with an explicit cursor-home before/after, matching the common `clear`
-        // sequence (`CSI 2J` + `CSI H`).
-        self.set_cursor_position(home)?;
-        self.backend.clear_region(ClearType::All)?;
-        self.set_cursor_position(home)?;
-        std::io::Write::flush(&mut self.backend)?;
-        self.visible_history_rows = 0;
-        self.previous_buffer_mut().reset();
-        Ok(())
-    }
-
-    /// Hard-reset scrollback + visible screen using an explicit ANSI sequence.
-    ///
-    /// Some terminals behave more reliably when purge + clear are emitted as a
-    /// single ANSI sequence instead of separate backend commands.
-    pub fn clear_scrollback_and_visible_screen_ansi(&mut self) -> io::Result<()> {
-        if self.viewport_area.is_empty() {
-            return Ok(());
-        }
-
-        // Reset scroll region + style state, home cursor, clear screen, purge scrollback.
-        // The order matches the common shell `clear && printf '\\e[3J'` behavior.
-        write!(self.backend, "\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[3J\x1b[H")?;
-        std::io::Write::flush(&mut self.backend)?;
-        self.last_known_cursor_pos = Position { x: 0, y: 0 };
-        self.visible_history_rows = 0;
-        self.previous_buffer_mut().reset();
-        Ok(())
-    }
-
     pub(crate) fn note_history_rows_inserted(&mut self, inserted_rows: u16) {
         self.visible_history_rows = self
             .visible_history_rows
@@ -644,6 +618,7 @@ where
 {
     let mut fg = Color::Reset;
     let mut bg = Color::Reset;
+    let mut underline_color = Color::Reset;
     let mut modifier = Modifier::empty();
     let mut last_pos: Option<Position> = None;
     let mut active_hyperlink: Option<String> = None;
@@ -687,6 +662,13 @@ where
                     fg = cell.fg;
                     bg = cell.bg;
                 }
+                if cell.underline_color != underline_color {
+                    queue!(
+                        writer,
+                        SetUnderlineColor(cell.underline_color.into_crossterm())
+                    )?;
+                    underline_color = cell.underline_color;
+                }
 
                 if hyperlink_changed && let Some(destination) = destination {
                     queue!(writer, Print(format!("\x1b]8;;{destination}\x07")))?;
@@ -699,6 +681,10 @@ where
                 modifier = Modifier::empty();
                 queue!(writer, SetBackgroundColor((*clear_bg).into_crossterm()))?;
                 bg = *clear_bg;
+                if underline_color != Color::Reset {
+                    queue!(writer, SetUnderlineColor(crossterm::style::Color::Reset))?;
+                    underline_color = Color::Reset;
+                }
                 queue!(writer, Clear(crossterm::terminal::ClearType::UntilNewLine))?;
             }
         }
@@ -710,6 +696,9 @@ where
         queue!(writer, Print("\x1b]8;;\x07"))?;
     }
 
+    if underline_color != Color::Reset {
+        queue!(writer, SetUnderlineColor(crossterm::style::Color::Reset))?;
+    }
     queue!(
         writer,
         SetForegroundColor(crossterm::style::Color::Reset),
@@ -792,6 +781,8 @@ mod tests {
     use super::*;
     use std::num::NonZeroU16;
 
+    use crossterm::execute;
+    use crossterm::terminal::LeaveAlternateScreen;
     use pretty_assertions::assert_eq;
     use ratatui::backend::WindowSize;
     use ratatui::layout::Rect;
@@ -902,6 +893,19 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    fn kitty_test_image() -> crate::terminal_image::KittyImage {
+        crate::terminal_image::KittyImage::new(
+            b"png".to_vec(),
+            /*image_id*/ 42,
+            /*columns*/ 2,
+            /*rows*/ 1,
+        )
+    }
+
+    fn kitty_test_terminal() -> Terminal<CaptureBackend> {
+        Terminal::with_options(CaptureBackend::new(/*width*/ 8, /*height*/ 6)).expect("terminal")
     }
 
     #[test]
@@ -1055,6 +1059,153 @@ mod tests {
         assert!(
             actual.contains(&expected),
             "expected terminal output to contain cursor style {expected:?}, got {actual:?}"
+        );
+    }
+
+    #[test]
+    fn terminal_draw_preserves_and_resets_underline_color_metadata() {
+        let mut expected = Vec::new();
+        let mut terminal =
+            Terminal::with_options(CaptureBackend::new(/*width*/ 2, /*height*/ 1))
+                .expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, 0, 2, 1));
+        let underline_color = Color::Rgb(1, 2, 3);
+
+        terminal
+            .draw(|frame| {
+                frame.buffer_mut().set_string(
+                    0,
+                    0,
+                    "X",
+                    Style::new().underline_color(underline_color),
+                );
+            })
+            .expect("draw");
+
+        queue!(
+            expected,
+            SetUnderlineColor(crossterm::style::Color::Rgb { r: 1, g: 2, b: 3 }),
+            Print("X"),
+            SetUnderlineColor(crossterm::style::Color::Reset),
+        )
+        .expect("queue expected metadata");
+        assert!(
+            terminal
+                .backend()
+                .output()
+                .contains(&String::from_utf8(expected).expect("UTF-8")),
+        );
+    }
+
+    #[test]
+    fn clearing_alternate_screen_allows_reupload_without_forgetting_main() {
+        let image = kitty_test_image();
+        let mut terminal = kitty_test_terminal();
+
+        terminal
+            .write_kitty_image_definitions([&image])
+            .expect("write main-screen definition");
+        terminal
+            .enter_alternate_screen()
+            .expect("enter alternate screen");
+        terminal
+            .write_kitty_image_definitions([&image])
+            .expect("write alternate-screen definition");
+        terminal
+            .clear_visible_screen()
+            .expect("clear alternate screen");
+        terminal
+            .write_kitty_image_definitions([&image])
+            .expect("reupload alternate-screen definition");
+        terminal
+            .leave_alternate_screen()
+            .expect("leave alternate screen");
+        terminal
+            .write_kitty_image_definitions([&image])
+            .expect("reuse main-screen definition");
+
+        let output = terminal.backend().output();
+        let definitions = output
+            .match_indices("\x1b_Ga=T")
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let deletions = output
+            .match_indices("\x1b_Ga=d,d=I,i=42,q=2;")
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let enter = output.find("\x1b[?1049h").expect("enter command");
+        let leave = output.find("\x1b[?1049l").expect("leave command");
+
+        assert_eq!((definitions.len(), deletions.len()), (3, 2));
+        assert!(definitions[0] < enter);
+        assert!(enter < definitions[1]);
+        assert!(definitions[1] < deletions[0]);
+        assert!(deletions[0] < definitions[2]);
+        assert!(definitions[2] < deletions[1]);
+        assert!(deletions[1] < leave);
+    }
+
+    #[test]
+    fn clearing_an_empty_main_viewport_deletes_and_forgets_images() {
+        let image = kitty_test_image();
+        let mut terminal = kitty_test_terminal();
+        assert!(terminal.viewport_area.is_empty());
+
+        terminal
+            .write_kitty_image_definitions([&image])
+            .expect("write image definition");
+        terminal
+            .clear_scrollback_and_visible_screen_ansi()
+            .expect("clear empty viewport");
+        terminal
+            .write_kitty_image_definitions([&image])
+            .expect("reupload image definition");
+
+        let output = terminal.backend().output();
+        let definitions = output
+            .match_indices("\x1b_Ga=T")
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let deletion = output
+            .find("\x1b_Ga=d,d=I,i=42,q=2;")
+            .expect("image deletion");
+        let clear = output.find("\x1b[2J\x1b[3J").expect("terminal clear");
+
+        assert_eq!(definitions.len(), 2);
+        assert!(definitions[0] < deletion);
+        assert!(deletion < clear);
+        assert!(clear < definitions[1]);
+    }
+
+    #[test]
+    fn resuming_alternate_screen_reuploads_cleared_definitions() {
+        let image = kitty_test_image();
+        let mut terminal = kitty_test_terminal();
+
+        terminal
+            .enter_alternate_screen()
+            .expect("enter alternate screen");
+        terminal
+            .write_kitty_image_definitions([&image])
+            .expect("write alternate-screen definition");
+        execute!(terminal.backend_mut(), LeaveAlternateScreen)
+            .expect("simulate raw job-control leave");
+        terminal
+            .resume_alternate_screen()
+            .expect("resume alternate screen");
+        terminal
+            .write_kitty_image_definitions([&image])
+            .expect("reuse alternate-screen definition");
+
+        let output = terminal.backend().output();
+        assert_eq!(
+            (
+                output.matches("\x1b[?1049h").count(),
+                output.matches("\x1b[?1049l").count(),
+                output.matches("\x1b_Ga=T").count(),
+                output.matches("\x1b_Ga=d,d=I").count(),
+            ),
+            (2, 1, 2, 0),
         );
     }
 

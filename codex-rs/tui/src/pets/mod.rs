@@ -158,7 +158,11 @@ fn render_pet_image(
 
     let Some(request) = request else {
         if state.last_protocol.take().is_some_and(is_kitty_protocol) {
-            write!(writer, "{}", image_protocol::kitty_delete_image(image_id))?;
+            write!(
+                writer,
+                "{}",
+                crate::terminal_image::kitty_delete_image(image_id)
+            )?;
         }
         if let Some(area) = state.last_sixel_clear_area.take() {
             queue!(writer, SavePosition)?;
@@ -172,13 +176,17 @@ fn render_pet_image(
     if state.last_protocol.take().is_some_and(is_kitty_protocol)
         || is_kitty_protocol(request.protocol)
     {
-        write!(writer, "{}", image_protocol::kitty_delete_image(image_id))?;
+        write!(
+            writer,
+            "{}",
+            crate::terminal_image::kitty_delete_image(image_id)
+        )?;
     }
     state.last_protocol = Some(request.protocol);
 
     let payload = match request.protocol {
         ImageProtocol::Kitty => AmbientPetPayload::Text(
-            image_protocol::kitty_transmit_png_with_id(
+            crate::terminal_image::kitty_transmit_png_with_id(
                 &request.frame,
                 request.columns,
                 request.rows,
@@ -187,7 +195,7 @@ fn render_pet_image(
             .map_err(PetImageRenderError::Asset)?,
         ),
         ImageProtocol::KittyLocalFile => AmbientPetPayload::Text(
-            image_protocol::kitty_transmit_png_file_with_id(
+            crate::terminal_image::kitty_transmit_png_file_with_id(
                 &request.frame,
                 request.columns,
                 request.rows,

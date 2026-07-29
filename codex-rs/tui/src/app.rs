@@ -526,6 +526,7 @@ pub(crate) struct App {
     pub(crate) file_search: FileSearchManager,
 
     pub(crate) transcript_cells: Vec<Arc<dyn HistoryCell>>,
+    latex_renderer: Option<crate::latex_renderer::LatexRenderer>,
 
     // Pager overlay state (Transcript or Static like Diff)
     pub(crate) overlay: Option<Overlay>,
@@ -1026,6 +1027,8 @@ Fix the config and retry.\n\
 See the Codex keymap documentation for supported actions and examples."
             )
         })?;
+        let latex_renderer =
+            crate::latex_renderer::LatexRenderer::new(app_event_tx.app_event_tx.clone());
         #[cfg(not(debug_assertions))]
         let upgrade_version = crate::updates::get_upgrade_version(&config);
 
@@ -1048,6 +1051,7 @@ See the Codex keymap documentation for supported actions and examples."
             enhanced_keys_supported,
             keymap: runtime_keymap,
             transcript_cells: Vec::new(),
+            latex_renderer,
             overlay: None,
             deferred_history_lines: Vec::new(),
             has_emitted_history_lines: false,

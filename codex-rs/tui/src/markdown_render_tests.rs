@@ -32,6 +32,78 @@ fn plain_lines(text: &Text<'_>) -> Vec<String> {
 }
 
 #[test]
+fn standalone_display_math_literal_fallback_snapshot() {
+    let rendered = render_markdown_text(
+        "Before.\n\n\\[\n\\text{fluid acceleration}\n=\n\\text{pressure forces}\n+\\text{viscous forces}\n\\]\n\nAfter.",
+    );
+
+    assert_snapshot!(plain_lines(&rendered).join("\n"), @r"
+    Before.
+
+    \[
+    \text{fluid acceleration}
+    =
+    \text{pressure forces}
+    +\text{viscous forces}
+    \]
+
+    After.
+    ");
+}
+
+#[test]
+fn explicit_inline_math_literal_fallback_preserves_source_and_tex_punctuation() {
+    let source =
+        r"Given \(x\in\ker f''\), compare \(\mathbf{x} * [y](z)\), but leave $HOME alone.";
+    let rendered = render_markdown_text_with_width(source, /*width*/ Some(80));
+
+    assert_eq!(plain_lines(&rendered), vec![source]);
+    assert!(
+        rendered
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .all(|span| !span.style.add_modifier.contains(Modifier::ITALIC))
+    );
+}
+
+#[test]
+fn inline_math_literal_fallback_preserves_source_when_every_mask_is_occupied() {
+    let occupied_masks = (1u8..=31)
+        .filter(|candidate| !candidate.is_ascii_whitespace())
+        .chain(std::iter::once(127))
+        .chain(b'A'..=b'Z')
+        .chain(b'a'..=b'z')
+        .chain(b'0'..=b'9')
+        .map(char::from)
+        .collect::<String>();
+    let source = format!("{occupied_masks} before \\(x\\) after");
+    let rendered = render_markdown_text_with_width(&source, /*width*/ None);
+
+    assert_eq!(plain_lines(&rendered), vec![source]);
+}
+
+#[test]
+fn inline_math_literal_fallback_preserves_code_links_and_tables() {
+    let source = "`\\(code\\)`\n\n[\\(linked\\)](https://example.com)\n\n| Math |\n| --- |\n| \\(table\\) |";
+    let rendered = plain_lines(&render_markdown_text_with_width(
+        source,
+        /*width*/ Some(80),
+    ))
+    .join("\n");
+
+    assert!(rendered.contains(r"\(code\)"));
+    assert!(rendered.contains(r"\(linked\)"));
+    assert!(rendered.contains(r"\(table\)"));
+    assert!(!rendered.chars().any(|character| {
+        matches!(
+            character,
+            '\u{001c}' | '\u{001d}' | '\u{001e}' | '\u{001f}'
+        )
+    }));
+}
+
+#[test]
 fn bare_url_with_tilde_keeps_complete_hyperlink() {
     let destination =
         "https://www.cs.tufts.edu/~nr/cs257/archive/olin-shivers/dissertation.pdf";

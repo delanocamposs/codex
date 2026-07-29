@@ -73,11 +73,14 @@ pub(crate) fn render_markdown_agent_with_links_and_cwd(
     width: Option<usize>,
     cwd: Option<&Path>,
 ) -> Vec<HyperlinkLine> {
-    render_markdown_agent_with_links_cwd_and_visualizations(
+    render_markdown_agent_with_options(
         markdown_source,
-        width,
-        cwd,
-        /*inline_visualization_context*/ None,
+        AgentMarkdownRenderOptions {
+            width,
+            cwd,
+            inline_visualization_context: None,
+            latex_renderer: None,
+        },
     )
 }
 
@@ -87,23 +90,72 @@ pub(crate) fn render_markdown_agent_with_links_cwd_and_visualizations(
     cwd: Option<&Path>,
     inline_visualization_context: Option<&InlineVisualizationContext>,
 ) -> Vec<HyperlinkLine> {
-    let rewritten = rewrite_inline_visualizations(markdown_source, inline_visualization_context);
-    let normalized = unwrap_markdown_fences(&rewritten.markdown);
-    let is_hidden_link_destination =
-        |destination: &str| rewritten.trusted_file_links.contains_key(destination);
-    let mut lines =
-        crate::markdown_render::render_markdown_lines_with_width_cwd_and_hidden_link_destinations(
-            &normalized,
+    render_markdown_agent_with_options(
+        markdown_source,
+        AgentMarkdownRenderOptions {
             width,
             cwd,
-            &is_hidden_link_destination,
-        );
+            inline_visualization_context,
+            latex_renderer: None,
+        },
+    )
+}
+
+pub(crate) struct AgentMarkdownRenderOptions<'a> {
+    pub(crate) width: Option<usize>,
+    pub(crate) cwd: Option<&'a Path>,
+    pub(crate) inline_visualization_context: Option<&'a InlineVisualizationContext>,
+    pub(crate) latex_renderer: Option<&'a crate::latex_renderer::LatexRenderHandle>,
+}
+
+pub(crate) fn render_markdown_agent_with_options(
+    markdown_source: &str,
+    render_options: AgentMarkdownRenderOptions<'_>,
+) -> Vec<HyperlinkLine> {
+    let AgentMarkdownRenderOptions {
+        width,
+        cwd,
+        inline_visualization_context,
+        latex_renderer,
+    } = render_options;
+    let normalized = normalize_agent_markdown(markdown_source, inline_visualization_context);
+    let is_hidden_link_destination =
+        |destination: &str| normalized.trusted_file_links.contains_key(destination);
+    let mut lines = crate::markdown_render::render_markdown_lines(
+        &normalized.markdown,
+        crate::markdown_render::MarkdownRenderOptions {
+            width,
+            cwd,
+            is_hidden_link_destination: &is_hidden_link_destination,
+            latex_renderer,
+        },
+    );
     for hyperlink in lines.iter_mut().flat_map(|line| &mut line.hyperlinks) {
-        if let Some(link) = rewritten.trusted_file_links.get(&hyperlink.destination) {
+        if let Some(link) = normalized.trusted_file_links.get(&hyperlink.destination) {
             hyperlink.retarget_to_trusted_file(&link.destination);
         }
     }
     lines
+}
+
+pub(crate) fn agent_markdown_contains_math(markdown_source: &str) -> bool {
+    // Math eligibility must stay pure. Inline-visualization normalization can materialize a
+    // viewer document, while fence unwrapping is the only normalization that changes whether
+    // Markdown source is parsed as prose or code.
+    let normalized = unwrap_markdown_fences(markdown_source);
+    crate::inline_math::PreparedInlineMath::new(&normalized).contains_math()
+}
+
+fn normalize_agent_markdown<'a>(
+    markdown_source: &'a str,
+    inline_visualization_context: Option<&InlineVisualizationContext>,
+) -> crate::inline_visualization::InlineVisualizationRewrite<'a> {
+    let mut rewritten =
+        rewrite_inline_visualizations(markdown_source, inline_visualization_context);
+    if let Cow::Owned(normalized) = unwrap_markdown_fences(&rewritten.markdown) {
+        rewritten.markdown = Cow::Owned(normalized);
+    }
+    rewritten
 }
 
 /// Render an agent message and collect the block metadata needed for incremental rendering.
@@ -461,6 +513,23 @@ mod tests {
         let rendered = lines_to_strings(&out);
         assert!(rendered.iter().any(|line| line.contains('━')));
         assert!(rendered.iter().any(|line| line.contains(" 1      2")));
+    }
+
+    #[test]
+    fn display_math_eligibility_uses_normalized_agent_markdown() {
+        let src = "```markdown\n| A | B |\n|---|---|\n| 1 | 2 |\n\n$$x^2$$\n```\n";
+
+        assert!(!crate::inline_math::PreparedInlineMath::new(src).contains_math());
+        assert!(agent_markdown_contains_math(src));
+    }
+
+    #[test]
+    fn explicit_inline_math_is_eligible_but_dollar_text_is_not() {
+        assert!(agent_markdown_contains_math(r"Given \(x\in\ker f''\)."));
+        assert!(!agent_markdown_contains_math("Use $HOME or discuss $x$."));
+        assert!(agent_markdown_contains_math(
+            "```markdown\n| A | B |\n|---|---|\n| 1 | 2 |\n\nGiven \\(x\\).\n```\n",
+        ));
     }
 
     #[test]

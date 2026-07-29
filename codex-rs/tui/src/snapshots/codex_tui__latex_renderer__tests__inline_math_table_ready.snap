@@ -1,0 +1,11 @@
+---
+source: tui/src/latex_renderer_tests.rs
+expression: snapshot
+---
+•  Kind       Value
+  ━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   first      before ▧▧▧▧▧ after
+  ─────────  ───────────────────────────────────────────────
+   second     ▧▧▧▧▧
+  ─────────  ───────────────────────────────────────────────
+   literal    \(code\) and \(linked\) (https://example.com)

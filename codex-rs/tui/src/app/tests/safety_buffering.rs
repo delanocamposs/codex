@@ -197,6 +197,7 @@ stream_max_retries = 0
         &mut tui,
         started,
         ThreadAttachPresentation::SessionLineage,
+        super::super::session_lifecycle::ThreadUiReset::Required,
         /*initial_user_message*/ None,
     )
     .await?;
@@ -411,6 +412,7 @@ goals = true
         &mut tui,
         started,
         ThreadAttachPresentation::SessionLineage,
+        super::super::session_lifecycle::ThreadUiReset::Required,
         /*initial_user_message*/ None,
     )
     .await?;

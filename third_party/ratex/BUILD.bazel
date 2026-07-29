@@ -1,0 +1,4 @@
+exports_files([
+    "THIRD_PARTY_NOTICES.txt",
+    "licenses/SIL-OFL-1.1.txt",
+])

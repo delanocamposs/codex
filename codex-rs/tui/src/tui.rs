@@ -23,8 +23,6 @@ use crossterm::event::EnableBracketedPaste;
 #[cfg(not(windows))]
 use crossterm::event::EnableFocusChange;
 use crossterm::event::KeyEvent;
-use crossterm::terminal::EnterAlternateScreen;
-use crossterm::terminal::LeaveAlternateScreen;
 #[cfg(not(unix))]
 use crossterm::terminal::supports_keyboard_enhancement;
 use ratatui::backend::Backend;
@@ -43,15 +41,14 @@ pub use self::frame_requester::FrameRequester;
 use crate::custom_terminal;
 use crate::custom_terminal::Terminal as CustomTerminal;
 use crate::insert_history::HistoryLineWrapPolicy;
-use crate::insert_history::InsertHistoryMode;
 use crate::notifications::DesktopNotificationBackend;
 use crate::notifications::detect_backend;
 use crate::terminal_hyperlinks::HyperlinkLine;
-use crate::terminal_hyperlinks::plain_hyperlink_lines;
 use crate::tui::event_stream::EventBroker;
 use crate::tui::event_stream::TuiEventStream;
 #[cfg(unix)]
 use crate::tui::job_control::SuspendContext;
+use crate::tui::pending_history::PendingHistory;
 use codex_config::types::NotificationCondition;
 use codex_config::types::NotificationMethod;
 
@@ -61,6 +58,7 @@ mod frame_requester;
 #[cfg(unix)]
 mod job_control;
 mod keyboard_modes;
+mod pending_history;
 mod terminal_stderr;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -440,6 +438,7 @@ pub(crate) fn init() -> Result<InitializedTerminal> {
                     cursor_position = probe.cursor_position.is_some(),
                     default_colors = probe.default_colors.is_some(),
                     keyboard_enhancement_supported = ?probe.keyboard_enhancement_supported,
+                    kitty_graphics_terminal = ?probe.kitty_graphics_terminal,
                     "terminal startup probes completed"
                 );
                 probe
@@ -453,6 +452,7 @@ pub(crate) fn init() -> Result<InitializedTerminal> {
                     cursor_position: None,
                     default_colors: None,
                     keyboard_enhancement_supported: None,
+                    kitty_graphics_terminal: None,
                 }
             }
         }
@@ -460,6 +460,10 @@ pub(crate) fn init() -> Result<InitializedTerminal> {
 
     #[cfg(unix)]
     crate::terminal_palette::set_default_colors_from_startup_probe(startup_probe.default_colors);
+    #[cfg(unix)]
+    crate::terminal_image::set_kitty_graphics_terminal_from_startup_probe(
+        startup_probe.kitty_graphics_terminal,
+    );
 
     #[cfg(unix)]
     let cursor_pos = match startup_probe.cursor_position {
@@ -562,7 +566,7 @@ pub struct Tui {
     draw_tx: broadcast::Sender<()>,
     event_broker: Arc<EventBroker>,
     pub(crate) terminal: Terminal,
-    pending_history_lines: Vec<PendingHistoryLines>,
+    pending_history: PendingHistory,
     ambient_pet_image_state: crate::pets::PetImageRenderState,
     pet_picker_preview_image_state: crate::pets::PetImageRenderState,
     alt_saved_viewport: Option<ratatui::layout::Rect>,
@@ -581,11 +585,6 @@ pub struct Tui {
     alt_screen_enabled: bool,
     // Keeps unmanaged process stderr writes out of the inline viewport.
     _stderr_guard: terminal_stderr::TerminalStderrGuard,
-}
-
-struct PendingHistoryLines {
-    lines: Vec<HyperlinkLine>,
-    wrap_policy: HistoryLineWrapPolicy,
 }
 
 fn clear_for_viewport_change<B>(terminal: &mut CustomTerminal<B>, new_area: Rect) -> Result<()>
@@ -619,7 +618,7 @@ impl Tui {
             draw_tx,
             event_broker: Arc::new(EventBroker::new()),
             terminal,
-            pending_history_lines: vec![],
+            pending_history: PendingHistory::default(),
             ambient_pet_image_state: crate::pets::PetImageRenderState::default(),
             pet_picker_preview_image_state: crate::pets::PetImageRenderState::default(),
             alt_saved_viewport: None,
@@ -767,10 +766,10 @@ impl Tui {
     /// Enter alternate screen and expand the viewport to full terminal size, saving the current
     /// inline viewport for restoration when leaving.
     pub fn enter_alt_screen(&mut self) -> Result<()> {
-        if !self.alt_screen_enabled {
+        if !self.alt_screen_enabled || self.is_alt_screen_active() {
             return Ok(());
         }
-        let _ = execute!(self.terminal.backend_mut(), EnterAlternateScreen);
+        self.terminal.enter_alternate_screen()?;
         // Enable "alternate scroll" so terminals may translate wheel to arrows
         let _ = execute!(self.terminal.backend_mut(), EnableAlternateScroll);
         if let Ok(size) = self.terminal.size() {
@@ -789,12 +788,12 @@ impl Tui {
 
     /// Leave alternate screen and restore the previously saved inline viewport, if any.
     pub fn leave_alt_screen(&mut self) -> Result<()> {
-        if !self.alt_screen_enabled {
+        if !self.alt_screen_enabled || !self.is_alt_screen_active() {
             return Ok(());
         }
         // Disable alternate scroll when leaving alt-screen
         let _ = execute!(self.terminal.backend_mut(), DisableAlternateScroll);
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        self.terminal.leave_alternate_screen()?;
         if let Some(saved) = self.alt_saved_viewport.take() {
             self.terminal.set_viewport_area(saved);
         }
@@ -811,12 +810,17 @@ impl Tui {
         lines: Vec<Line<'static>>,
         wrap_policy: HistoryLineWrapPolicy,
     ) {
-        self.insert_history_hyperlink_lines_with_wrap_policy(
-            plain_hyperlink_lines(lines),
-            wrap_policy,
-        );
+        if lines.is_empty() {
+            return;
+        }
+        self.pending_history.insert_one_shot(lines, wrap_policy);
+        self.frame_requester().schedule_frame();
     }
 
+    /// Queues source-backed transcript rows for insertion into terminal scrollback.
+    ///
+    /// Keeping these rows distinct from headers and diagnostics lets resize recovery replace only
+    /// stale transcript output without silently dropping unrelated pending history.
     pub(crate) fn insert_history_hyperlink_lines_with_wrap_policy(
         &mut self,
         lines: Vec<HyperlinkLine>,
@@ -825,19 +829,23 @@ impl Tui {
         if lines.is_empty() {
             return;
         }
-        if let Some(last) = self.pending_history_lines.last_mut()
-            && last.wrap_policy == wrap_policy
-        {
-            last.lines.extend(lines);
-        } else {
-            self.pending_history_lines
-                .push(PendingHistoryLines { lines, wrap_policy });
-        }
+        self.pending_history.insert_transcript(lines, wrap_policy);
         self.frame_requester().schedule_frame();
     }
 
+    /// Drops queued history and any repair request that referred to those rows.
     pub fn clear_pending_history_lines(&mut self) {
-        self.pending_history_lines.clear();
+        self.pending_history.clear();
+    }
+
+    /// Drops queued source-backed rows while preserving one-shot headers and diagnostics.
+    pub(crate) fn discard_pending_transcript_history_lines(&mut self) {
+        self.pending_history.discard_transcript();
+    }
+
+    /// Returns whether a width race deferred image rows that must be rebuilt from transcript cells.
+    pub(crate) fn take_history_source_reflow_needed(&mut self) -> bool {
+        self.pending_history.take_source_reflow_needed()
     }
 
     /// Resize the inline viewport for the resize-reflow path.
@@ -883,33 +891,6 @@ impl Tui {
         Ok(needs_full_repaint)
     }
 
-    /// Write any buffered history lines above the viewport and clear the buffer.
-    fn flush_pending_history_lines(
-        terminal: &mut Terminal,
-        pending_history_lines: &mut Vec<PendingHistoryLines>,
-        is_zellij: bool,
-    ) -> Result<()> {
-        if pending_history_lines.is_empty() {
-            return Ok(());
-        }
-
-        for batch in pending_history_lines.iter() {
-            let mode = if is_zellij && batch.wrap_policy == HistoryLineWrapPolicy::Terminal {
-                InsertHistoryMode::ZellijRaw
-            } else {
-                InsertHistoryMode::Standard
-            };
-            crate::insert_history::insert_history_hyperlink_lines_with_mode_and_wrap_policy(
-                terminal,
-                &batch.lines,
-                mode,
-                batch.wrap_policy,
-            )?;
-        }
-        pending_history_lines.clear();
-        Ok(())
-    }
-
     pub fn draw(
         &mut self,
         height: u16,
@@ -928,7 +909,7 @@ impl Tui {
 
         ensure_virtual_terminal_processing()?;
 
-        stdout().sync_update(|_| {
+        let result = stdout().sync_update(|_| {
             #[cfg(unix)]
             if let Some(prepared) = prepared_resume.take() {
                 prepared.apply(&mut self.terminal)?;
@@ -959,11 +940,7 @@ impl Tui {
                 terminal.set_viewport_area(area);
             }
 
-            Self::flush_pending_history_lines(
-                terminal,
-                &mut self.pending_history_lines,
-                self.is_zellij,
-            )?;
+            self.pending_history.flush(terminal, self.is_zellij)?;
 
             // Update the y position for suspending so Ctrl-Z can place the cursor correctly.
             #[cfg(unix)]
@@ -982,7 +959,11 @@ impl Tui {
             terminal.draw(|frame| {
                 draw_fn(frame);
             })
-        })?
+        })?;
+        if self.pending_history.source_reflow_needed() {
+            self.frame_requester().schedule_frame();
+        }
+        result
     }
 
     pub fn draw_ambient_pet_image(
@@ -1060,7 +1041,7 @@ impl Tui {
 
         ensure_virtual_terminal_processing()?;
 
-        stdout().sync_update(|_| {
+        let result = stdout().sync_update(|_| {
             #[cfg(unix)]
             if let Some(prepared) = prepared_resume.take() {
                 prepared.apply(&mut self.terminal)?;
@@ -1069,11 +1050,7 @@ impl Tui {
             let terminal = &mut self.terminal;
             let needs_full_repaint =
                 Self::update_inline_viewport_for_resize_reflow(terminal, height)?;
-            Self::flush_pending_history_lines(
-                terminal,
-                &mut self.pending_history_lines,
-                self.is_zellij,
-            )?;
+            self.pending_history.flush(terminal, self.is_zellij)?;
 
             if needs_full_repaint {
                 terminal.invalidate_viewport();
@@ -1096,7 +1073,11 @@ impl Tui {
             terminal.draw(|frame| {
                 draw_fn(frame);
             })
-        })?
+        })?;
+        if self.pending_history.source_reflow_needed() {
+            self.frame_requester().schedule_frame();
+        }
+        result
     }
 
     fn pending_viewport_area(&mut self) -> Result<Option<Rect>> {

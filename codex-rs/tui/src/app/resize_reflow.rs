@@ -122,11 +122,15 @@ impl App {
 
     /// Start retaining a thread-switch transcript replay without rendering each historical cell.
     ///
-    /// Thread switches already rebuild `transcript_cells` from source. When a row cap exists, we can
-    /// defer terminal writes until the replay is complete and reuse the resize-reflow tail renderer
-    /// so only the rows the terminal would retain are formatted and inserted.
+    /// Thread switches already rebuild `transcript_cells` from source. When a row cap or display
+    /// math renderer exists, defer terminal writes until replay is complete and reuse the
+    /// resize-reflow tail renderer. This avoids formatting rows the terminal would discard and
+    /// ensures a bounded math cache admits the newest formulas first even when the row cap is
+    /// disabled.
     pub(super) fn begin_thread_switch_history_replay_buffer(&mut self) {
-        if self.resize_reflow_max_rows().is_some() && self.overlay.is_none() {
+        if (self.resize_reflow_max_rows().is_some() || self.latex_renderer.is_some())
+            && self.overlay.is_none()
+        {
             self.initial_history_replay_buffer = Some(InitialHistoryReplayBuffer {
                 retained_lines: VecDeque::new(),
                 render_from_transcript_tail: true,
@@ -219,6 +223,25 @@ impl App {
         while buffer.retained_lines.len() > max_rows {
             buffer.retained_lines.pop_front();
         }
+    }
+
+    /// Rebuild finalized scrollback after an asynchronous display-math render becomes available.
+    ///
+    /// A normal frame redraw cannot replace rows already committed to terminal scrollback. Route
+    /// the update through the existing source-backed reflow path, and coalesce formulas that finish
+    /// close together. Results from a cleared or replaced transcript generation are ignored.
+    pub(super) fn schedule_latex_reflow(&mut self, tui: &mut tui::Tui, generation: u64) {
+        let Some(renderer) = self.latex_renderer.as_ref() else {
+            return;
+        };
+        if renderer.generation() != generation {
+            return;
+        }
+
+        self.transcript_reflow
+            .schedule_debounced(/*target_width*/ None);
+        tui.frame_requester()
+            .schedule_frame_in(TRANSCRIPT_REFLOW_DEBOUNCE);
     }
 
     fn schedule_resize_reflow(&mut self, target_width: Option<u16>) -> bool {
@@ -343,6 +366,7 @@ impl App {
     }
 
     pub(super) fn handle_draw_pre_render(&mut self, tui: &mut tui::Tui) -> Result<()> {
+        let history_source_reflow_needed = tui.take_history_source_reflow_needed();
         let size = tui.terminal.size()?;
         let should_rebuild_transcript = self.handle_draw_size_change(
             size,
@@ -351,9 +375,12 @@ impl App {
         );
         if should_rebuild_transcript {
             // Resize-sensitive history inserts queued before this frame may be wrapped for the old
-            // viewport or targeted at rows no longer visible. Drop them and let resize reflow
-            // rebuild from transcript cells.
-            tui.clear_pending_history_lines();
+            // viewport or targeted at rows no longer visible. Drop only transcript rows so the
+            // source-backed replay does not lose a queued one-shot header or diagnostic.
+            tui.discard_pending_transcript_history_lines();
+        }
+        if history_source_reflow_needed {
+            self.schedule_immediate_resize_reflow(tui);
         }
         self.maybe_run_resize_reflow(tui)?;
         Ok(())
@@ -409,8 +436,7 @@ impl App {
         let terminal_width = tui.terminal.size()?.width;
         let width = self.chat_widget.history_wrap_width(terminal_width);
         if self.transcript_cells.is_empty() {
-            // Drop any queued pre-resize/pre-consolidation inserts before rebuilding from cells.
-            tui.clear_pending_history_lines();
+            tui.discard_pending_transcript_history_lines();
             self.reset_history_emission_state();
             return Ok(terminal_width);
         }
@@ -418,8 +444,9 @@ impl App {
         let reflow_result = self.render_transcript_lines_for_reflow(width);
         let reflowed_lines = reflow_result.lines;
 
-        // Drop any queued pre-resize/pre-consolidation inserts before rebuilding from cells.
-        tui.clear_pending_history_lines();
+        // One-shot history producers currently precede transcript replay. Retain those rows and
+        // append the rebuilt source-backed transcript behind them after clearing the terminal.
+        tui.discard_pending_transcript_history_lines();
         self.clear_terminal_for_resize_replay(tui)?;
 
         self.deferred_history_lines.clear();
@@ -448,7 +475,7 @@ impl App {
             self.render_transcript_lines_for_reflow(width).lines
         };
 
-        tui.clear_pending_history_lines();
+        tui.discard_pending_transcript_history_lines();
         self.clear_terminal_for_resize_replay(tui)?;
 
         self.deferred_history_lines.clear();

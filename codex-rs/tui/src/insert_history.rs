@@ -9,11 +9,10 @@ use std::io::Write;
 
 use crate::render::line_utils::line_to_static;
 use crate::terminal_hyperlinks::HyperlinkLine;
+use crate::terminal_hyperlinks::adaptive_wrap_hyperlink_line;
 use crate::terminal_hyperlinks::decorate_spans;
 use crate::terminal_hyperlinks::plain_hyperlink_lines;
-use crate::terminal_hyperlinks::remap_wrapped_line;
 use crate::wrapping::RtOptions;
-use crate::wrapping::adaptive_wrap_line;
 use crate::wrapping::line_contains_url_like;
 use crate::wrapping::line_has_mixed_url_and_non_url_tokens;
 use crossterm::Command;
@@ -30,6 +29,7 @@ use crossterm::style::SetAttribute;
 use crossterm::style::SetBackgroundColor;
 use crossterm::style::SetColors;
 use crossterm::style::SetForegroundColor;
+use crossterm::style::SetUnderlineColor;
 use crossterm::terminal::Clear;
 use crossterm::terminal::ClearType;
 use ratatui::backend::IntoCrossterm;
@@ -141,16 +141,9 @@ where
             {
                 vec![line.clone()]
             }
-            HistoryLineWrapPolicy::PreWrap => remap_wrapped_line(
+            HistoryLineWrapPolicy::PreWrap => adaptive_wrap_hyperlink_line(
                 line,
-                adaptive_wrap_line(
-                    &line.line,
-                    RtOptions::new(wrap_width)
-                        .subsequent_indent(leading_whitespace_prefix(&line.line)),
-                )
-                .into_iter()
-                .map(|line| line_to_static(&line))
-                .collect(),
+                RtOptions::new(wrap_width).subsequent_indent(leading_whitespace_prefix(&line.line)),
             ),
         };
         wrapped_rows += line_wrapped
@@ -160,6 +153,12 @@ where
         wrapped.extend(line_wrapped);
     }
     let wrapped_lines = wrapped_rows as u16;
+    terminal.write_kitty_image_definitions(
+        wrapped
+            .iter()
+            .flat_map(|line| &line.kitty_images)
+            .map(|annotation| &annotation.image),
+    )?;
     match mode {
         InsertHistoryMode::ZellijRaw => {
             // The existing viewport is immediately replaced in the same draw pass. Clear it
@@ -324,6 +323,7 @@ fn write_history_line<W: Write>(
     let merged_line = HyperlinkLine {
         line: Line::from(merged_spans),
         hyperlinks: line.hyperlinks.clone(),
+        kitty_images: Vec::new(),
     };
     let decorated = decorate_spans(&merged_line);
     write_spans(writer, decorated.iter())
@@ -442,6 +442,7 @@ where
 {
     let mut fg = Color::Reset;
     let mut bg = Color::Reset;
+    let mut underline_color = Color::Reset;
     let mut last_modifier = Modifier::empty();
     for span in content {
         let mut modifier = Modifier::empty();
@@ -468,10 +469,21 @@ where
             fg = next_fg;
             bg = next_bg;
         }
+        let next_underline_color = span.style.underline_color.unwrap_or(Color::Reset);
+        if next_underline_color != underline_color {
+            queue!(
+                writer,
+                SetUnderlineColor(next_underline_color.into_crossterm())
+            )?;
+            underline_color = next_underline_color;
+        }
 
         queue!(writer, Print(span.content.clone()))?;
     }
 
+    if underline_color != Color::Reset {
+        queue!(writer, SetUnderlineColor(CColor::Reset))?;
+    }
     queue!(
         writer,
         SetForegroundColor(CColor::Reset),
@@ -487,6 +499,7 @@ mod tests {
     use crate::test_backend::VT100Backend;
     use ratatui::layout::Rect;
     use ratatui::style::Color;
+    use ratatui::style::Style;
 
     #[test]
     fn writes_bold_then_regular_spans() {
@@ -517,6 +530,27 @@ mod tests {
     }
 
     #[test]
+    fn writes_and_resets_underline_color_metadata_for_kitty_placement_ids() {
+        let spans = [Span::from("X").style(Style::new().underline_color(Color::Rgb(1, 2, 3)))];
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+
+        write_spans(&mut actual, spans.iter()).expect("write styled span");
+        queue!(
+            expected,
+            SetUnderlineColor(CColor::Rgb { r: 1, g: 2, b: 3 }),
+            Print("X"),
+            SetUnderlineColor(CColor::Reset),
+            SetForegroundColor(CColor::Reset),
+            SetBackgroundColor(CColor::Reset),
+            SetAttribute(crossterm::style::Attribute::Reset),
+        )
+        .expect("queue expected metadata");
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn writes_semantic_web_link_without_changing_visible_text() {
         let destination = "https://example.com/long/path";
         let line = crate::terminal_hyperlinks::annotate_web_urls_in_line(Line::from(destination));
@@ -527,6 +561,69 @@ mod tests {
         let output = String::from_utf8(actual).expect("UTF-8 terminal output");
         assert!(output.contains("\x1b]8;;https://example.com/long/path\x07"));
         assert_eq!(line.line.spans[0].content, destination);
+    }
+
+    #[test]
+    fn kitty_definition_precedes_placeholders_and_is_reused_until_full_transcript_clear() {
+        let width = 8;
+        let height = 6;
+        let placeholder = "\u{10eeee}";
+        let image = crate::terminal_image::KittyImage::new(
+            b"png".to_vec(),
+            /*image_id*/ 42,
+            /*columns*/ 2,
+            /*rows*/ 1,
+        );
+        let mut line = HyperlinkLine::new(Line::from(placeholder.repeat(2)));
+        line.kitty_images
+            .push(crate::terminal_hyperlinks::KittyImageAnnotation {
+                columns: 0..2,
+                image,
+            });
+        let backend = VT100Backend::new(width, height);
+        let mut terminal =
+            crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, height - 1, width, 1));
+
+        for _ in 0..2 {
+            insert_history_hyperlink_lines_with_mode_and_wrap_policy(
+                &mut terminal,
+                std::slice::from_ref(&line),
+                InsertHistoryMode::Standard,
+                HistoryLineWrapPolicy::PreWrap,
+            )
+            .expect("insert image history");
+        }
+        terminal
+            .clear_scrollback_and_visible_screen_ansi()
+            .expect("clear transcript");
+        insert_history_hyperlink_lines_with_mode_and_wrap_policy(
+            &mut terminal,
+            std::slice::from_ref(&line),
+            InsertHistoryMode::Standard,
+            HistoryLineWrapPolicy::PreWrap,
+        )
+        .expect("reinsert image history");
+
+        let output = std::str::from_utf8(&terminal.backend().raw_output).expect("UTF-8 output");
+        let definitions = output
+            .match_indices("\x1b_Ga=T")
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let deletion = output
+            .find("\x1b_Ga=d,d=I,i=42,q=2;")
+            .expect("Kitty image deletion");
+        let clear = output.find("\x1b[2J\x1b[3J").expect("terminal clear");
+
+        assert_eq!(definitions.len(), 2);
+        assert!(
+            definitions[0] < output.find(placeholder).expect("placeholder"),
+            "the image definition must precede its first placeholder",
+        );
+        assert_eq!(output.matches(placeholder).count(), 6);
+        assert!(definitions[0] < deletion);
+        assert!(deletion < clear);
+        assert!(clear < definitions[1]);
     }
 
     #[test]

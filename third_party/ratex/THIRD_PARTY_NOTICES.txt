@@ -1,0 +1,12 @@
+KaTeX Font Software
+===================
+
+RaTeX 0.1.14 embeds 20 unmodified KaTeX TrueType fonts in the Codex binary.
+Their internal metadata identifies the SIL Open Font License, Version 1.1, and
+the following copyright holders:
+
+Copyright (c) 2009-2010, Design Science, Inc. (<www.mathjax.org>)
+Copyright (c) 2014-2018 Khan Academy (<www.khanacademy.org>)
+
+The font bytes match the corresponding files in katex@0.16.9. The full license
+text is in licenses/SIL-OFL-1.1.txt.

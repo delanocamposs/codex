@@ -14,6 +14,13 @@
 
 use std::time::Duration;
 
+#[cfg(unix)]
+mod kitty;
+
+// The complete startup reply batch is normally well under 1 KiB. Keep enough trailing input for
+// split replies and modest unrelated noise without letting an exclusive probe accumulate input.
+const MAX_PROBE_BUFFER_BYTES: usize = 4 * 1024;
+
 /// Default wall-clock budget for each startup probe group.
 pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -30,6 +37,7 @@ pub(crate) struct DefaultColors {
 #[cfg_attr(test, allow(dead_code))]
 mod imp {
     use super::DefaultColors;
+    use super::kitty;
     use super::parse_default_colors;
     use std::fs::File;
     use std::fs::OpenOptions;
@@ -43,12 +51,15 @@ mod imp {
     use crossterm::event::KeyboardEnhancementFlags;
     use ratatui::layout::Position;
 
+    use crate::terminal_image::KittyGraphicsTerminal;
+
     /// Results from the TUI's one-shot startup terminal probe.
     #[derive(Debug, Clone, Copy, Eq, PartialEq)]
     pub(crate) struct StartupProbe {
         pub(crate) cursor_position: Option<Position>,
         pub(crate) default_colors: Option<DefaultColors>,
         pub(crate) keyboard_enhancement_supported: Option<bool>,
+        pub(crate) kitty_graphics_terminal: Option<KittyGraphicsTerminal>,
     }
 
     /// Whether the startup probe should query keyboard enhancement support.
@@ -142,30 +153,28 @@ mod imp {
 
         fn read_available(&mut self, buffer: &mut Vec<u8>) -> io::Result<()> {
             let mut chunk = [0_u8; 256];
-            loop {
-                let count = unsafe {
-                    libc::read(
-                        self.reader.as_raw_fd(),
-                        chunk.as_mut_ptr().cast::<libc::c_void>(),
-                        chunk.len(),
-                    )
-                };
-                if count > 0 {
-                    buffer.extend_from_slice(&chunk[..count as usize]);
-                    continue;
-                }
-                if count == 0 {
-                    return Ok(());
-                }
-                let err = io::Error::last_os_error();
-                if matches!(
-                    err.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                ) {
-                    return Ok(());
-                }
-                return Err(err);
+            let count = unsafe {
+                libc::read(
+                    self.reader.as_raw_fd(),
+                    chunk.as_mut_ptr().cast::<libc::c_void>(),
+                    chunk.len(),
+                )
+            };
+            if count > 0 {
+                super::append_probe_bytes(buffer, &chunk[..count as usize]);
+                return Ok(());
             }
+            if count == 0 {
+                return Ok(());
+            }
+            let err = io::Error::last_os_error();
+            if matches!(
+                err.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ) {
+                return Ok(());
+            }
+            Err(err)
         }
 
         fn poll_readable(&self, timeout: Duration) -> io::Result<bool> {
@@ -251,23 +260,28 @@ mod imp {
         timeout: Duration,
         keyboard_probe: StartupKeyboardEnhancementProbe,
     ) -> io::Result<StartupProbe> {
+        let kitty_graphics_probe = kitty::startup_version_probe();
         let mut tty = Tty::open()?;
-        match keyboard_probe {
-            StartupKeyboardEnhancementProbe::Query => {
-                tty.write_all(b"\x1B[6n\x1B]10;?\x1B\\\x1B]11;?\x1B\\\x1B[?u\x1B[c")?;
-            }
-            StartupKeyboardEnhancementProbe::Skip => {
-                tty.write_all(b"\x1B[6n\x1B]10;?\x1B\\\x1B]11;?\x1B\\")?;
-            }
-        }
-        read_startup_probe(&mut tty, timeout, keyboard_probe)
+        let mut query = kitty_graphics_probe.query_bytes().to_vec();
+        query.extend_from_slice(&startup_query(keyboard_probe));
+        tty.write_all(&query)?;
+        read_startup_probe(&mut tty, timeout, keyboard_probe, kitty_graphics_probe)
+    }
+
+    fn startup_query(keyboard_probe: StartupKeyboardEnhancementProbe) -> Vec<u8> {
+        let mut query = b"\x1B[6n\x1B]10;?\x1B\\\x1B]11;?\x1B\\".to_vec();
+        query.extend_from_slice(match keyboard_probe {
+            StartupKeyboardEnhancementProbe::Query => b"\x1B[?u\x1B[c",
+            StartupKeyboardEnhancementProbe::Skip => b"",
+        });
+        query
     }
 
     /// Reads available terminal bytes until `parse` recognizes a probe response or time expires.
     ///
-    /// The accumulated buffer may include unrelated terminal input. This helper intentionally does
-    /// not try to replay those bytes, so callers must use it only during short, exclusive probe
-    /// windows before normal crossterm input polling begins or while that polling is paused.
+    /// The bounded rolling buffer may include unrelated terminal input. This helper intentionally
+    /// does not try to replay those bytes, so callers must use it only during short, exclusive
+    /// probe windows before normal crossterm input polling begins or while that polling is paused.
     fn read_until<T>(
         tty: &mut Tty,
         timeout: Duration,
@@ -294,6 +308,7 @@ mod imp {
         tty: &mut Tty,
         timeout: Duration,
         keyboard_probe: StartupKeyboardEnhancementProbe,
+        mut kitty_graphics_probe: kitty::StartupVersionProbe,
     ) -> io::Result<StartupProbe> {
         let deadline = Instant::now() + timeout;
         let mut buffer = Vec::new();
@@ -301,6 +316,7 @@ mod imp {
             cursor_position: None,
             default_colors: None,
             keyboard_enhancement_supported: None,
+            kitty_graphics_terminal: None,
         };
         let mut saw_supported_keyboard = false;
         loop {
@@ -311,7 +327,10 @@ mod imp {
                 &buffer,
                 keyboard_probe,
             );
-            if startup_probe_complete(&probe, keyboard_probe) {
+            kitty_graphics_probe.observe(&buffer);
+            probe.kitty_graphics_terminal = kitty_graphics_probe.terminal();
+            if startup_probe_complete(&probe, keyboard_probe) && kitty_graphics_probe.is_complete()
+            {
                 return Ok(probe);
             }
             let now = Instant::now();
@@ -478,7 +497,7 @@ mod imp {
         None
     }
 
-    fn find_all_subslices<'a>(
+    pub(super) fn find_all_subslices<'a>(
         haystack: &'a [u8],
         needle: &'a [u8],
     ) -> impl Iterator<Item = usize> + 'a {
@@ -492,6 +511,7 @@ mod imp {
     mod tests {
         use super::*;
         use pretty_assertions::assert_eq;
+        use std::thread;
 
         #[test]
         fn parses_cursor_position_as_zero_based() {
@@ -530,17 +550,31 @@ mod imp {
         }
 
         #[test]
+        fn startup_query_omits_keyboard_bytes_when_probe_is_disabled() {
+            assert_eq!(
+                startup_query(StartupKeyboardEnhancementProbe::Skip),
+                b"\x1B[6n\x1B]10;?\x1B\\\x1B]11;?\x1B\\"
+            );
+            assert_eq!(
+                startup_query(StartupKeyboardEnhancementProbe::Query),
+                b"\x1B[6n\x1B]10;?\x1B\\\x1B]11;?\x1B\\\x1B[?u\x1B[c"
+            );
+        }
+
+        #[test]
         fn startup_probe_parses_batched_terminal_responses() {
             let mut probe = StartupProbe {
                 cursor_position: None,
                 default_colors: None,
                 keyboard_enhancement_supported: None,
+                kitty_graphics_terminal: None,
             };
             let mut saw_supported_keyboard = false;
             update_startup_probe(
                 &mut probe,
                 &mut saw_supported_keyboard,
-                b"\x1B[20;10R\x1B]11;rgb:1111/1111/1111\x07\x1B[?64;1;2c\x1B]10;rgb:eeee/eeee/eeee\x1B\\\x1B[?7u",
+                b"\x1B[20;10R\x1B]11;rgb:1111/1111/1111\x07\
+                  \x1B[?64;1;2c\x1B]10;rgb:eeee/eeee/eeee\x1B\\\x1B[?7u",
                 StartupKeyboardEnhancementProbe::Query,
             );
 
@@ -553,12 +587,84 @@ mod imp {
                         bg: (17, 17, 17),
                     }),
                     keyboard_enhancement_supported: Some(true),
+                    kitty_graphics_terminal: None,
                 }
             );
             assert!(startup_probe_complete(
                 &probe,
                 StartupKeyboardEnhancementProbe::Query
             ));
+        }
+
+        #[test]
+        fn startup_reader_waits_for_later_split_xtversion_reply() {
+            let cases = [
+                (
+                    b"\x1BP>|kitty(0.".as_slice(),
+                    b"48.1)\x1B\\".as_slice(),
+                    KittyGraphicsTerminal::Kitty {
+                        version: (0, 48, 1),
+                    },
+                ),
+                (
+                    b"\x1BP>|ghostty 1.3.".as_slice(),
+                    b"1-arch2\x1B\\".as_slice(),
+                    KittyGraphicsTerminal::Ghostty { version: (1, 3, 1) },
+                ),
+            ];
+
+            for (version_prefix, version_suffix, expected_terminal) in cases {
+                let mut descriptors = [-1; 2];
+                if unsafe { libc::pipe(descriptors.as_mut_ptr()) } == -1 {
+                    panic!("create terminal pipe: {}", io::Error::last_os_error());
+                }
+                // SAFETY: `pipe` initialized both descriptors above, and each is transferred to
+                // exactly one owning `File`.
+                let reader = unsafe { File::from_raw_fd(descriptors[0]) };
+                // SAFETY: See the ownership argument above for the pipe's write descriptor.
+                let mut replies = unsafe { File::from_raw_fd(descriptors[1]) };
+                replies
+                    .write_all(
+                        b"\x1B[20;10R\
+                          \x1B]10;rgb:eeee/eeee/eeee\x1B\\\
+                          \x1B]11;rgb:1111/1111/1111\x07",
+                    )
+                    .expect("write ordinary startup replies");
+                let writer = reader.try_clone().expect("clone terminal handle");
+                let mut tty = Tty::new(reader, writer).expect("create nonblocking terminal");
+                let response_thread = thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(10));
+                    replies
+                        .write_all(version_prefix)
+                        .expect("write split version prefix");
+                    thread::sleep(Duration::from_millis(10));
+                    replies
+                        .write_all(version_suffix)
+                        .expect("write split version suffix");
+                });
+
+                let probe = read_startup_probe(
+                    &mut tty,
+                    Duration::from_secs(1),
+                    StartupKeyboardEnhancementProbe::Skip,
+                    kitty::StartupVersionProbe::query(),
+                )
+                .expect("read startup probe");
+                response_thread.join().expect("join response writer");
+
+                assert_eq!(
+                    probe,
+                    StartupProbe {
+                        cursor_position: Some(Position { x: 9, y: 19 }),
+                        default_colors: Some(DefaultColors {
+                            fg: (238, 238, 238),
+                            bg: (17, 17, 17),
+                        }),
+                        keyboard_enhancement_supported: None,
+                        kitty_graphics_terminal: Some(expected_terminal),
+                    },
+                );
+            }
         }
     }
 }
@@ -753,7 +859,7 @@ mod imp {
         if ok == 0 {
             return Err(io::Error::last_os_error());
         }
-        buffer.extend_from_slice(&chunk[..read as usize]);
+        super::append_probe_bytes(buffer, &chunk[..read as usize]);
         Ok(())
     }
 
@@ -824,6 +930,21 @@ mod imp {
     }
 }
 
+fn append_probe_bytes(buffer: &mut Vec<u8>, bytes: &[u8]) {
+    if bytes.len() >= MAX_PROBE_BUFFER_BYTES {
+        buffer.clear();
+        buffer.extend_from_slice(&bytes[bytes.len() - MAX_PROBE_BUFFER_BYTES..]);
+        return;
+    }
+
+    let overflow = buffer
+        .len()
+        .saturating_add(bytes.len())
+        .saturating_sub(MAX_PROBE_BUFFER_BYTES);
+    buffer.drain(..overflow);
+    buffer.extend_from_slice(bytes);
+}
+
 fn parse_osc_color(buffer: &[u8], slot: u8) -> Option<(u8, u8, u8)> {
     let prefix = format!("\x1B]{slot};");
     let start = find_subslice(buffer, prefix.as_bytes())?;
@@ -891,6 +1012,17 @@ pub(crate) use imp::*;
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn probe_buffer_is_bounded_and_retains_recent_bytes() {
+        let mut buffer = vec![b'x'; MAX_PROBE_BUFFER_BYTES];
+        let recent = b"\x1BP>|kitty(0.48.1)\x1B\\";
+        append_probe_bytes(&mut buffer, recent);
+
+        let mut expected = vec![b'x'; MAX_PROBE_BUFFER_BYTES - recent.len()];
+        expected.extend_from_slice(recent);
+        assert_eq!(buffer, expected);
+    }
 
     #[test]
     fn parses_osc_colors_with_bel_and_st() {
