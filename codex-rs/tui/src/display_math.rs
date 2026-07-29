@@ -4,6 +4,7 @@ use pulldown_cmark::Event;
 use pulldown_cmark::Options;
 use pulldown_cmark::Parser;
 use pulldown_cmark::Tag;
+use pulldown_cmark::TagEnd;
 use std::borrow::Cow;
 use std::ops::Range;
 
@@ -20,8 +21,9 @@ pub(crate) struct DisplayMathSpan<'a> {
 /// CommonMark can otherwise interpret TeX lines as Markdown structure before
 /// the final renderer sees them. In particular, a formula line containing only `=` turns the
 /// preceding line into a Setext heading. A parse of the unmodified source first excludes candidates
-/// in lists, block quotes, code blocks, tables, and HTML. A masked discovery parse then accepts
-/// complete top-level paragraphs, and only those formulas remain masked in the result.
+/// in block quotes, code blocks, tables, and HTML. A masked discovery parse then accepts complete
+/// top-level paragraphs and paragraphs whose only ancestors are list/item containers, and only
+/// those formulas remain masked in the result.
 pub(crate) struct PreparedDisplayMath<'a> {
     markdown: Cow<'a, str>,
     spans: Vec<DisplayMathSpan<'a>>,
@@ -42,7 +44,7 @@ impl<'a> PreparedDisplayMath<'a> {
         if candidates.is_empty() {
             return unchanged();
         }
-        let probe_candidates = top_level_text_candidates(source, &candidates);
+        let probe_candidates = eligible_text_candidates(source, &candidates);
         if probe_candidates.is_empty() {
             return unchanged();
         }
@@ -51,8 +53,9 @@ impl<'a> PreparedDisplayMath<'a> {
         for candidate in &probe_candidates {
             mask_formula(&mut probe, candidate.formula_range.clone(), mask);
         }
-        let probe =
-            String::from_utf8(probe).expect("ASCII display-math masking must preserve valid UTF-8");
+        let Ok(probe) = String::from_utf8(probe) else {
+            unreachable!("ASCII display-math masking must preserve valid UTF-8");
+        };
         let accepted = accepted_display_math_candidates(source, &probe, &probe_candidates);
         if accepted.is_empty() {
             return unchanged();
@@ -68,11 +71,11 @@ impl<'a> PreparedDisplayMath<'a> {
                 formula: &source[candidate.formula_range.clone()],
             });
         }
+        let Ok(markdown) = String::from_utf8(markdown) else {
+            unreachable!("ASCII display-math masking must preserve valid UTF-8");
+        };
         Self {
-            markdown: Cow::Owned(
-                String::from_utf8(markdown)
-                    .expect("ASCII display-math masking must preserve valid UTF-8"),
-            ),
+            markdown: Cow::Owned(markdown),
             spans,
             pending_start,
         }
@@ -102,26 +105,26 @@ fn pending_display_math_start(
         Some(_) | None => {}
     }
     markdown.push(mask);
-    let markdown =
-        String::from_utf8(markdown).expect("ASCII display-math masking must preserve valid UTF-8");
-    let mut depth = 0usize;
+    let Ok(markdown) = String::from_utf8(markdown) else {
+        unreachable!("ASCII display-math masking must preserve valid UTF-8");
+    };
+    let mut ancestors = Vec::new();
 
     for (event, range) in Parser::new_ext(&markdown, markdown_options()).into_offset_iter() {
-        if depth == 0
-            && matches!(event, Event::Start(Tag::Paragraph))
-            && range.start <= candidate.delimiter_start
+        if let Some(container_range) = display_math_container(&event, &range, &ancestors)
+            && range.start < candidate.formula_start
             && candidate.delimiter_start < range.end
-            && source[range.start..candidate.delimiter_start]
-                .trim()
-                .is_empty()
+            && (ancestors.is_empty()
+                && source[range.start..candidate.delimiter_start]
+                    .trim()
+                    .is_empty()
+                || !ancestors.is_empty()
+                    && container_range.start <= candidate.delimiter_start
+                    && candidate.delimiter_start < container_range.end)
         {
             return Some(range.start.min(candidate.block_start));
         }
-        match event {
-            Event::Start(_) => depth += 1,
-            Event::End(_) => depth = depth.saturating_sub(1),
-            _ => {}
-        }
+        update_ancestors(&event, &range, &mut ancestors);
     }
 
     None
@@ -185,10 +188,7 @@ fn display_math_candidates(
     while let Some(line) = lines.next() {
         let parsed = display_line(line);
         if let Some(opening) = open.take() {
-            let Some((content, content_start)) = parsed else {
-                open = Some(opening);
-                continue;
-            };
+            let (content, content_start) = parsed;
             if content == opening.closer {
                 let formula_range = opening.formula_start..content_start;
                 if !source[formula_range.clone()].trim().is_empty() {
@@ -207,9 +207,7 @@ fn display_math_candidates(
             continue;
         }
 
-        let Some((trimmed, trimmed_start)) = parsed else {
-            continue;
-        };
+        let (trimmed, trimmed_start) = parsed;
         let Some((opener, closer)) = display_delimiters(trimmed) else {
             continue;
         };
@@ -300,64 +298,103 @@ fn accepted_display_math_candidates<'a>(
     candidates: &[&'a DisplayMathCandidate],
 ) -> Vec<&'a DisplayMathCandidate> {
     let mut accepted = Vec::new();
-    let mut depth = 0usize;
+    let mut ancestors = Vec::new();
 
     for (event, range) in Parser::new_ext(markdown, markdown_options()).into_offset_iter() {
-        if depth == 0
-            && matches!(&event, Event::Start(Tag::Paragraph))
-            && let Some(candidate) = candidates.iter().copied().find(|candidate| {
-                range.start <= candidate.block_range.start
-                    && candidate.block_range.end <= range.end
-                    && source[range.clone()].trim() == &source[candidate.block_range.clone()]
-            })
-            && !contains_html(&source[candidate.block_range.clone()])
-        {
-            accepted.push(candidate);
+        if let Some(container_range) = display_math_container(&event, &range, &ancestors) {
+            let start = candidates
+                .partition_point(|candidate| candidate.formula_range.start <= range.start);
+            let end = start
+                + candidates[start..]
+                    .partition_point(|candidate| candidate.block_range.start < range.end);
+            accepted.extend(candidates[start..end].iter().copied().filter(|candidate| {
+                container_range.start <= candidate.block_range.start
+                    && candidate.block_range.end <= container_range.end
+                    && (!ancestors.is_empty()
+                        || source[container_range.clone()].trim()
+                            == &source[candidate.block_range.clone()])
+                    && !contains_html(&source[candidate.block_range.clone()])
+            }));
         }
-        match event {
-            Event::Start(_) => depth += 1,
-            Event::End(_) => depth = depth.saturating_sub(1),
-            _ => {}
-        }
+        update_ancestors(&event, &range, &mut ancestors);
     }
 
     accepted
 }
 
-fn top_level_text_candidates<'a>(
+fn eligible_text_candidates<'a>(
     source: &str,
     candidates: &'a [DisplayMathCandidate],
 ) -> Vec<&'a DisplayMathCandidate> {
-    let mut depth = 0usize;
-    let mut top_level = Vec::new();
+    let mut ancestors = Vec::new();
+    let mut eligible = Vec::new();
 
     for (event, range) in Parser::new_ext(source, markdown_options()).into_offset_iter() {
-        if depth == 0 && matches!(&event, Event::Start(Tag::Paragraph | Tag::Heading { .. })) {
-            top_level.extend(
-                candidates
-                    .iter()
-                    .filter(|candidate| range.contains(&candidate.block_range.start)),
-            );
+        if let Some(container_range) = display_math_container(&event, &range, &ancestors) {
+            let start = candidates
+                .partition_point(|candidate| candidate.formula_range.start <= range.start);
+            let end = start
+                + candidates[start..]
+                    .partition_point(|candidate| candidate.block_range.start < range.end);
+            eligible.extend(candidates[start..end].iter().filter(|candidate| {
+                (ancestors.is_empty()
+                    && matches!(&event, Event::Start(Tag::Paragraph | Tag::Heading { .. })))
+                    || (container_range.start <= candidate.block_range.start
+                        && candidate.block_range.end <= container_range.end)
+            }));
         }
-        match event {
-            Event::Start(_) => depth += 1,
-            Event::End(_) => depth = depth.saturating_sub(1),
-            _ => {}
-        }
+        update_ancestors(&event, &range, &mut ancestors);
     }
 
-    top_level
+    eligible
 }
 
-fn display_line(line: SourceLine<'_>) -> Option<(&str, usize)> {
-    let text = line.text.strip_suffix('\r').unwrap_or(line.text);
-    let leading_spaces = text.bytes().take_while(|byte| *byte == b' ').count();
-    if leading_spaces > 3 || text.as_bytes().get(leading_spaces) == Some(&b'\t') {
+type MarkdownAncestor = (TagEnd, Range<usize>);
+
+fn display_math_container(
+    event: &Event<'_>,
+    event_range: &Range<usize>,
+    ancestors: &[MarkdownAncestor],
+) -> Option<Range<usize>> {
+    if !ancestors
+        .iter()
+        .all(|(tag, _)| matches!(tag, TagEnd::List(_) | TagEnd::Item))
+    {
         return None;
     }
+    let item_range = ancestors
+        .iter()
+        .rev()
+        .find_map(|(tag, range)| matches!(tag, TagEnd::Item).then(|| range.clone()));
+    match event {
+        Event::Start(Tag::Paragraph | Tag::Heading { .. }) => {
+            Some(item_range.unwrap_or_else(|| event_range.clone()))
+        }
+        Event::Text(_) | Event::SoftBreak | Event::HardBreak => item_range,
+        _ => None,
+    }
+}
+
+fn update_ancestors(
+    event: &Event<'_>,
+    range: &Range<usize>,
+    ancestors: &mut Vec<MarkdownAncestor>,
+) {
+    match event {
+        Event::Start(tag) => ancestors.push((tag.to_end(), range.clone())),
+        Event::End(_) => {
+            ancestors.pop();
+        }
+        _ => {}
+    }
+}
+
+fn display_line(line: SourceLine<'_>) -> (&str, usize) {
+    let text = line.text.strip_suffix('\r').unwrap_or(line.text);
+    let leading_spaces = text.bytes().take_while(|byte| *byte == b' ').count();
     let content = &text[leading_spaces..];
     let trimmed = content.trim_end_matches([' ', '\t']);
-    Some((trimmed, line.start + leading_spaces))
+    (trimmed, line.start + leading_spaces)
 }
 
 fn display_delimiters(line: &str) -> Option<(&'static str, &'static str)> {

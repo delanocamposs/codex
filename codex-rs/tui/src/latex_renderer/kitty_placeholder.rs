@@ -211,7 +211,6 @@ pub(super) fn placeholder_lines(
 
 pub(super) fn inline_placeholder_line(rendered: &RenderedImage, columns: u16) -> HyperlinkLine {
     placeholder_lines(rendered, columns, /*rows*/ 1)
-        .into_iter()
-        .next()
-        .expect("one-row placeholder layout must produce one line")
+        .pop()
+        .unwrap_or_default()
 }

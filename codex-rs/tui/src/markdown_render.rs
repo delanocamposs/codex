@@ -403,7 +403,6 @@ where
     link: Option<LinkState>,
     needs_newline: bool,
     pending_marker_line: bool,
-    in_paragraph: bool,
     in_code_block: bool,
     code_block_lang: Option<String>,
     code_block_buffer: String,
@@ -447,7 +446,6 @@ where
             link: None,
             needs_newline: false,
             pending_marker_line: false,
-            in_paragraph: false,
             in_code_block: false,
             code_block_lang: None,
             code_block_buffer: String::new(),
@@ -581,7 +579,6 @@ where
         }
         self.push_line(Line::default());
         self.needs_newline = false;
-        self.in_paragraph = true;
     }
 
     fn end_paragraph(&mut self) {
@@ -589,7 +586,6 @@ where
             return;
         }
         self.needs_newline = true;
-        self.in_paragraph = false;
         self.pending_marker_line = false;
     }
 

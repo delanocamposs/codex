@@ -1,7 +1,6 @@
 //! Generation-local LaTeX cache and bounded negative memory.
 
 use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::sync::Arc;
 
 use super::RenderedImage;
@@ -14,7 +13,7 @@ pub(super) const NEGATIVE_KEY_CAPACITY: usize = 64;
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct RenderKey {
     pub(super) generation: u64,
-    pub(super) formula: String,
+    pub(super) formula: crate::latex_image::ValidatedLatexFormula,
     pub(super) foreground: [u8; 3],
     pub(super) style: LatexRenderStyle,
     pub(super) cell_height: u32,
@@ -27,7 +26,7 @@ pub(super) enum RenderAdmission {
 }
 
 impl RenderAdmission {
-    pub(super) fn effective(self, latest_live_admission_id: u64) -> Self {
+    fn effective(self, latest_live_admission_id: u64) -> Self {
         match self {
             Self::Live(admission_id) if admission_id == latest_live_admission_id => self,
             Self::Historical | Self::Live(_) => Self::Historical,
@@ -42,6 +41,8 @@ enum RenderState {
 
 struct CacheEntry {
     admission: RenderAdmission,
+    // A bounded scan over ranks avoids storing every potentially large key twice.
+    priority: i64,
     state: RenderState,
 }
 
@@ -85,10 +86,12 @@ impl BoundedKeyMemory {
 
 #[derive(Default)]
 pub(super) struct RenderCache {
+    latest_live_admission_id: u64,
+    entry_capacity: usize,
+    byte_capacity: usize,
+    terminal_byte_capacity: usize,
     selected_cell_height: Option<u32>,
     entries: HashMap<RenderKey, CacheEntry>,
-    /// Highest-priority entries first.
-    entry_priority: VecDeque<RenderKey>,
     bytes: usize,
     terminal_bytes: usize,
     failed: BoundedKeyMemory,
@@ -97,26 +100,39 @@ pub(super) struct RenderCache {
     live_rejections: BoundedKeyMemory,
 }
 
+pub(super) enum CacheCompletion {
+    Missing,
+    Updated,
+    ImageIdExhausted,
+}
+
 impl RenderCache {
-    pub(super) fn begin_live_admission(&mut self) {
+    pub(super) fn new(limits: RendererLimits) -> Self {
+        Self {
+            entry_capacity: limits.cache_entry_capacity,
+            byte_capacity: limits.cache_byte_capacity,
+            terminal_byte_capacity: limits.cache_terminal_byte_capacity,
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn begin_live_admission(&mut self) -> RenderAdmission {
+        self.latest_live_admission_id = self.latest_live_admission_id.wrapping_add(1);
         self.live_rejections.clear();
+        RenderAdmission::Live(self.latest_live_admission_id)
     }
 
     pub(super) fn select_cell_height(&mut self, cell_height: u32) {
         if self.selected_cell_height != Some(cell_height) {
-            *self = Self {
-                selected_cell_height: Some(cell_height),
-                ..Self::default()
-            };
+            self.clear();
+            self.selected_cell_height = Some(cell_height);
         }
     }
 
-    pub(super) fn lookup(
-        &mut self,
-        key: &RenderKey,
-        admission: RenderAdmission,
-        latest_live_admission_id: u64,
-    ) -> CacheLookup {
+    pub(super) fn lookup(&mut self, key: &RenderKey, admission: RenderAdmission) -> CacheLookup {
+        let admission = admission.effective(self.latest_live_admission_id);
+        let priority =
+            matches!(admission, RenderAdmission::Live(_)).then(|| self.next_priority(admission));
         let Some(entry) = self.entries.get_mut(key) else {
             return CacheLookup::Missing;
         };
@@ -124,30 +140,15 @@ impl RenderCache {
             RenderState::Pending => CacheLookup::Pending,
             RenderState::Ready(image) => CacheLookup::Ready(Arc::clone(image)),
         };
-        if matches!(
-            admission.effective(latest_live_admission_id),
-            RenderAdmission::Live(_)
-        ) {
+        if let Some(priority) = priority {
             entry.admission = admission;
-            let position = self
-                .entry_priority
-                .iter()
-                .position(|candidate| candidate == key)
-                .expect("LaTeX cache entry should have an eviction-order key");
-            self.entry_priority.remove(position);
-            self.entry_priority.push_front(key.clone());
+            entry.priority = priority;
         }
         result
     }
 
-    pub(super) fn can_admit(
-        &mut self,
-        key: &RenderKey,
-        admission: RenderAdmission,
-        latest_live_admission_id: u64,
-        entry_capacity: usize,
-    ) -> bool {
-        let admission = admission.effective(latest_live_admission_id);
+    pub(super) fn can_admit(&mut self, key: &RenderKey, admission: RenderAdmission) -> bool {
+        let admission = admission.effective(self.latest_live_admission_id);
         let blocked = match admission {
             RenderAdmission::Historical => {
                 self.failed.blocks(key) || self.historical_capacity.blocks(key)
@@ -159,16 +160,13 @@ impl RenderCache {
         if blocked {
             return false;
         }
-        if self.entries.len() < entry_capacity {
+        if self.entries.len() < self.entry_capacity {
             return true;
         }
         match admission {
             RenderAdmission::Historical => false,
             RenderAdmission::Live(_) => {
-                if self
-                    .least_priority_evictable_key(latest_live_admission_id)
-                    .is_some()
-                {
+                if self.least_priority_evictable_key().is_some() {
                     true
                 } else {
                     self.live_rejections.exhausted = true;
@@ -178,31 +176,24 @@ impl RenderCache {
         }
     }
 
-    pub(super) fn insert_pending(
-        &mut self,
-        key: RenderKey,
-        admission: RenderAdmission,
-        latest_live_admission_id: u64,
-        entry_capacity: usize,
-    ) {
-        if self.entries.len() == entry_capacity {
-            let eviction_key = self
-                .least_priority_evictable_key(latest_live_admission_id)
-                .expect("admission should reserve an evictable LaTeX cache entry");
+    pub(super) fn insert_pending(&mut self, key: RenderKey, admission: RenderAdmission) {
+        if self.entries.len() == self.entry_capacity {
+            let Some(eviction_key) = self.least_priority_evictable_key() else {
+                return;
+            };
             self.remove_entry(&eviction_key);
         }
+        let admission = admission.effective(self.latest_live_admission_id);
+        let priority = self.next_priority(admission);
         let previous = self.entries.insert(
-            key.clone(),
+            key,
             CacheEntry {
                 admission,
+                priority,
                 state: RenderState::Pending,
             },
         );
         debug_assert!(previous.is_none());
-        match admission.effective(latest_live_admission_id) {
-            RenderAdmission::Historical => self.entry_priority.push_back(key),
-            RenderAdmission::Live(_) => self.entry_priority.push_front(key),
-        }
     }
 
     pub(super) fn contains_pending(&self, key: &RenderKey) -> bool {
@@ -220,37 +211,41 @@ impl RenderCache {
         key: &RenderKey,
         png: LatexPng,
         terminal_bytes: usize,
-        latest_live_admission_id: u64,
-        limits: RendererLimits,
-    ) -> bool {
+    ) -> CacheCompletion {
         let Some(CacheEntry {
             admission,
             state: RenderState::Pending,
+            ..
         }) = self.entries.get(key)
         else {
-            return false;
+            return CacheCompletion::Missing;
         };
-        let admission = admission.effective(latest_live_admission_id);
+        let admission = admission.effective(self.latest_live_admission_id);
         let png_bytes = png.bytes.len();
 
         while matches!(admission, RenderAdmission::Live(_))
-            && !self.fits(png_bytes, terminal_bytes, limits)
-            && let Some(eviction_key) = self.least_priority_evictable_key(latest_live_admission_id)
+            && !self.fits(png_bytes, terminal_bytes)
+            && let Some(eviction_key) = self.least_priority_evictable_key()
         {
             self.remove_entry(&eviction_key);
         }
 
-        if self.fits(png_bytes, terminal_bytes, limits)
-            && let Some(image) = RenderedImage::new_with_terminal_bytes(png, terminal_bytes)
-        {
+        if self.fits(png_bytes, terminal_bytes) {
+            let Some(image_id) = super::kitty_placeholder::next_image_id() else {
+                self.remove_entry(key);
+                return CacheCompletion::ImageIdExhausted;
+            };
+            let Some(entry) = self.entries.get_mut(key) else {
+                return CacheCompletion::Missing;
+            };
             self.bytes += png_bytes;
             self.terminal_bytes += terminal_bytes;
-            let entry = self
-                .entries
-                .get_mut(key)
-                .expect("pending LaTeX cache entry should still exist");
             entry.admission = admission;
-            entry.state = RenderState::Ready(Arc::new(image));
+            entry.state = RenderState::Ready(Arc::new(RenderedImage::new_with_terminal_bytes(
+                png,
+                terminal_bytes,
+                image_id,
+            )));
         } else {
             self.remove_entry(key);
             match admission {
@@ -258,18 +253,19 @@ impl RenderCache {
                 RenderAdmission::Live(_) => self.live_rejections.record(key),
             }
         }
-        true
+        CacheCompletion::Updated
     }
 
-    pub(super) fn fail(&mut self, key: &RenderKey, latest_live_admission_id: u64) -> bool {
+    pub(super) fn fail(&mut self, key: &RenderKey) -> bool {
         let Some(CacheEntry {
             admission,
             state: RenderState::Pending,
+            ..
         }) = self.entries.get(key)
         else {
             return false;
         };
-        let admission = admission.effective(latest_live_admission_id);
+        let admission = admission.effective(self.latest_live_admission_id);
         self.remove_entry(key);
         self.failed.record(key);
         if matches!(admission, RenderAdmission::Live(_)) {
@@ -285,47 +281,48 @@ impl RenderCache {
     }
 
     pub(super) fn clear(&mut self) {
-        *self = Self::default();
+        self.selected_cell_height = None;
+        self.entries.clear();
+        self.bytes = 0;
+        self.terminal_bytes = 0;
+        self.failed.clear();
+        self.historical_capacity.clear();
+        self.live_rejections.clear();
     }
 
-    fn fits(&self, png_bytes: usize, terminal_bytes: usize, limits: RendererLimits) -> bool {
-        self.bytes.saturating_add(png_bytes) <= limits.cache_byte_capacity
-            && self.terminal_bytes.saturating_add(terminal_bytes)
-                <= limits.cache_terminal_byte_capacity
+    fn fits(&self, png_bytes: usize, terminal_bytes: usize) -> bool {
+        self.bytes.saturating_add(png_bytes) <= self.byte_capacity
+            && self.terminal_bytes.saturating_add(terminal_bytes) <= self.terminal_byte_capacity
     }
 
-    fn least_priority_evictable_key(&self, latest_live_admission_id: u64) -> Option<RenderKey> {
-        self.entry_priority
+    fn least_priority_evictable_key(&self) -> Option<RenderKey> {
+        self.entries
             .iter()
-            .rev()
-            .find(|key| {
-                self.entries.get(*key).is_some_and(|entry| {
-                    matches!(
-                        entry.admission.effective(latest_live_admission_id),
-                        RenderAdmission::Historical
-                    )
-                })
+            .filter(|(_, entry)| {
+                matches!(
+                    entry.admission.effective(self.latest_live_admission_id),
+                    RenderAdmission::Historical
+                )
             })
-            .cloned()
+            .min_by_key(|(_, entry)| entry.priority)
+            .map(|(key, _)| key.clone())
+    }
+
+    fn next_priority(&self, admission: RenderAdmission) -> i64 {
+        let priorities = self.entries.values().map(|entry| entry.priority);
+        match admission {
+            RenderAdmission::Historical => priorities.min().unwrap_or(0).saturating_sub(1),
+            RenderAdmission::Live(_) => priorities.max().unwrap_or(0).saturating_add(1),
+        }
     }
 
     fn remove_entry(&mut self, key: &RenderKey) -> Option<CacheEntry> {
         let entry = self.entries.remove(key)?;
-        let position = self
-            .entry_priority
-            .iter()
-            .position(|candidate| candidate == key)
-            .expect("LaTeX cache entry should have an eviction-order key");
-        self.entry_priority.remove(position);
         if let RenderState::Ready(image) = &entry.state {
-            self.bytes = self
-                .bytes
-                .checked_sub(image.png.bytes.len())
-                .expect("LaTeX cache byte accounting should not underflow");
-            self.terminal_bytes = self
-                .terminal_bytes
-                .checked_sub(image.terminal_bytes)
-                .expect("LaTeX terminal byte accounting should not underflow");
+            debug_assert!(self.bytes >= image.png.bytes.len());
+            debug_assert!(self.terminal_bytes >= image.terminal_bytes);
+            self.bytes = self.bytes.saturating_sub(image.png.bytes.len());
+            self.terminal_bytes = self.terminal_bytes.saturating_sub(image.terminal_bytes);
         }
         Some(entry)
     }

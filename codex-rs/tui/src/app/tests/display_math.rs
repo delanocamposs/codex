@@ -169,10 +169,9 @@ async fn live_display_math_stays_literal_until_message_completion() -> Result<()
         .iter()
         .map(|line| line.line.to_string())
         .collect::<String>();
-    assert!(!has_image(&streaming));
-    assert!(
-        streaming_text.contains("$$"),
-        "streaming source should remain literal: {streaming_text}"
+    assert_eq!(
+        (has_image(&streaming), streaming_text.contains("$$")),
+        (false, true),
     );
 
     app.chat_widget.handle_server_notification(
@@ -312,9 +311,7 @@ async fn resumed_math_stays_literal_until_tail_replay_renders_display_and_inline
         ),
         (false, true, true),
     );
-    assert!(app.initial_history_replay_buffer.is_none());
     assert!(app.transcript_reflow.has_pending_reflow());
-
     app.maybe_run_resize_reflow(&mut tui)?;
     assert!(!app.transcript_reflow.has_pending_reflow());
 

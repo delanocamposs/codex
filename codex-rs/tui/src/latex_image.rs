@@ -66,8 +66,8 @@ const MACRO_MUTATION_CONTROLS: [&str; 11] = [
     "providecommand",
 ];
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ValidatedLatexFormula(Box<str>);
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ValidatedLatexFormula(Arc<str>);
 
 impl ValidatedLatexFormula {
     pub(crate) fn new(formula: &str) -> Result<Self, LatexImageError> {

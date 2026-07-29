@@ -86,6 +86,7 @@ fn inline_layout_is_one_row_and_preserves_aspect_ratio_within_its_cap() {
 }
 
 #[test]
+#[allow(clippy::disallowed_methods)]
 fn placeholder_grid_has_exact_coordinates_and_metadata() {
     let rendered = RenderedImage::new(test_png()).expect("available image ID");
 

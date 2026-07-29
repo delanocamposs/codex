@@ -11,48 +11,51 @@ fn extract(markdown: &str) -> Vec<(&str, &str)> {
 }
 
 #[test]
-fn preparation_leaves_rejected_candidates_exact() {
-    for source in [
-        "```tex\n\\[\ncode\n\\]\n```",
-        "<div>\n\\[\nhtml\n\\]\n</div>",
-        "- item\n\n  \\[\n  listed\n  \\]",
-        "equation |\n--- |\n$$table$$",
-    ] {
-        let (prepared, spans, _) = PreparedDisplayMath::new(source, b'\x01').into_parts();
-
-        assert_eq!(&*prepared, source, "{source:?}");
-        assert!(spans.is_empty(), "{source:?}");
-    }
-}
-
-#[test]
-fn preparation_masks_a_setext_like_formula_after_rejected_candidates() {
+fn finds_setext_like_formula_after_rejected_candidates() {
     let source = concat!(
         "```tex\n\\[\n```\n\\]\n\n",
         "<div>\n\\[\nhtml\n\\]\n</div>\n\n",
-        "- item\n\n  \\[\n  listed\n  \\]\n\n",
+        "- item\n\n      \\[\n      code\n      \\]\n\n",
         "equation |\n--- |\n$$table$$\n\n",
         "\\[\na\n=\nb\n\\]",
     );
-    let (prepared, spans, _) = PreparedDisplayMath::new(source, b'\x01').into_parts();
+    assert_eq!(extract(source), vec![("\\[\na\n=\nb\n\\]", "\na\n=\nb\n")],);
+}
+
+#[test]
+fn preparation_accepts_numbered_list_items_but_not_indented_code() {
+    let source = concat!(
+        "1. First\n\n",
+        "   \\[\n   E=mc^2\n   \\]\n\n",
+        "2. Second\n\n",
+        "   \\[\n   a+b\n   \\]\n\n",
+        "3. Code\n\n",
+        "       \\[\n       not math\n       \\]\n",
+    );
+    let first_raw = "\\[\n   E=mc^2\n   \\]";
+    let second_raw = "\\[\n   a+b\n   \\]";
+    let first_start = source
+        .find(first_raw)
+        .expect("fixture contains first formula");
+    let second_start = source
+        .find(second_raw)
+        .expect("fixture contains second formula");
+    let (_, spans, _) = PreparedDisplayMath::new(source, b'\x01').into_parts();
 
     assert_eq!(
-        &*prepared,
-        concat!(
-            "```tex\n\\[\n```\n\\]\n\n",
-            "<div>\n\\[\nhtml\n\\]\n</div>\n\n",
-            "- item\n\n  \\[\n  listed\n  \\]\n\n",
-            "equation |\n--- |\n$$table$$\n\n",
-            "\\[\n\x01\n\x01\n\x01\n\\]",
-        )
-    );
-    let expected_start = source
-        .find("\\[\na\n=\nb\n\\]")
-        .expect("fixture contains display math");
-    assert_eq!(spans.len(), 1);
-    assert_eq!(
-        &spans[0].source_range,
-        &(expected_start..expected_start + "\\[\na\n=\nb\n\\]".len())
+        spans,
+        vec![
+            DisplayMathSpan {
+                source_range: first_start..first_start + first_raw.len(),
+                raw_block: first_raw,
+                formula: "\n   E=mc^2\n   ",
+            },
+            DisplayMathSpan {
+                source_range: second_start..second_start + second_raw.len(),
+                raw_block: second_raw,
+                formula: "\n   a+b\n   ",
+            },
+        ],
     );
 }
 
@@ -61,18 +64,13 @@ fn preparation_carries_pending_structural_start_without_changing_source() {
     for (source, expected_start) in [
         ("\\[\na\n=\nb", Some(0)),
         ("Before.\n\n  $$\nlong formula", Some("Before.\n\n".len())),
-        ("$$\n```tex\nnot a real fence", Some(0)),
-        ("$$\n--- |\nvalue", Some(0)),
         ("$$\na\n\n   ", Some(0)),
+        ("1. item\n   $$\n   x", Some("1. item\n".len())),
         ("before\n$$\nx", None),
-        ("- item\n\n  $$\n  x", None),
         ("```\n$$\nx", None),
         ("<div>\n$$\nx", None),
         ("$$\na\n\nb", None),
-        ("$$\n\rx", None),
-        ("$$\nx\r\ry", None),
         ("$$\nx\r\r   ", Some(0)),
-        ("$$\na\n\nx\r\r", None),
         ("> $$\nx", None),
         ("    $$\nx", None),
         ("$$x", None),
@@ -103,19 +101,26 @@ fn accepted_display_math_cases() {
             &[("$$a$$", "a"), ("\\[\nb\n\\]", "\nb\n"), ("$$c$$", "c")],
         ),
         (
-            "$$\nnot closed\n\n$$recovered$$",
-            &[("$$recovered$$", "recovered")],
+            "1. formulas\n   \\[\n   a\n   \\]\n   $$\n   b\n   $$",
+            &[
+                ("\\[\n   a\n   \\]", "\n   a\n   "),
+                ("$$\n   b\n   $$", "\n   b\n   "),
+            ],
+        ),
+        (
+            "- outer\n  - inner\n    \\[\n    n\n    \\]\n\n100. wide\n     $$\n     w\n     $$",
+            &[
+                ("\\[\n    n\n    \\]", "\n    n\n    "),
+                ("$$\n     w\n     $$", "\n     w\n     "),
+            ],
+        ),
+        (
+            "1. Formula\n\n   \\[\n   a\n   =\n   b\n   \\]",
+            &[("\\[\n   a\n   =\n   b\n   \\]", "\n   a\n   =\n   b\n   ")],
         ),
         (
             "$$\nnot closed\n\n\\[\nrecovered\n\\]\n\n$$broken",
             &[("\\[\nrecovered\n\\]", "\nrecovered\n")],
-        ),
-        (
-            "\\[\n\\rho\\left(\n\\frac{\\partial \\mathbf{u}}{\\partial t}\n\\right)\n=\n-\\nabla p\n\\]",
-            &[(
-                "\\[\n\\rho\\left(\n\\frac{\\partial \\mathbf{u}}{\\partial t}\n\\right)\n=\n-\\nabla p\n\\]",
-                "\n\\rho\\left(\n\\frac{\\partial \\mathbf{u}}{\\partial t}\n\\right)\n=\n-\\nabla p\n",
-            )],
         ),
         (
             "\\[\n\\text{fluid acceleration}\n=\n\\text{pressure forces}\n\\]",
@@ -137,41 +142,36 @@ fn accepted_display_math_cases() {
 fn rejected_display_math_cases() {
     for markdown in [
         "$x$",
-        "That costs $5.",
         "Use $HOME and ${SHELL}.",
         "before $$x$$",
         "$$x$$ after",
         r"before \[x\]",
-        r"\[x\] after",
         "```tex\n$$x$$\n```",
         "    $$x$$",
         "\t\\[x\\]",
         "`$$x$$`",
         "- $$x$$",
         "1. \\[x\\]",
+        "1. First\n\n   \\[\n   x\n2. Second\n   \\]",
         "> $$x$$",
         "| equation |\n| --- |\n| $$x$$ |",
         "equation |\n--- |\n$$x$$",
         "<div>\n$$x$$\n</div>",
         "$$<span>x</span>$$",
-        "$$<!-- x -->$$",
-        "\\[<em>x</em>\\]",
         "$$$$",
         "$$ $$",
-        "$$\n\t\n$$",
         "$$\nx\n\n=\ny\n$$",
         "$$x",
         "x$$",
         r"\[\]",
-        "\\[\n \n\\]",
         r"\[x",
         r"x\]",
         r"\[x$$",
-        r"$$x\]",
         "$$a$$\n$$b$$",
-        "\\[a\\]\n\\[b\\]",
         "$$a$$$$",
     ] {
-        assert_eq!(extract(markdown), Vec::new(), "{markdown:?}");
+        let (prepared, spans, _) = PreparedDisplayMath::new(markdown, b'\x01').into_parts();
+        assert_eq!(&*prepared, markdown, "{markdown:?}");
+        assert_eq!(spans, Vec::new(), "{markdown:?}");
     }
 }

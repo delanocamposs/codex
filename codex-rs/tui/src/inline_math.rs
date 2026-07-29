@@ -86,11 +86,11 @@ impl<'a> PreparedInlineMath<'a> {
             })
             .collect();
 
+        let Ok(masked) = String::from_utf8(masked) else {
+            unreachable!("ASCII inline-math masking must preserve valid UTF-8");
+        };
         Self {
-            markdown: Cow::Owned(
-                String::from_utf8(masked)
-                    .expect("ASCII inline-math masking must preserve valid UTF-8"),
-            ),
+            markdown: Cow::Owned(masked),
             mask: Some(char::from(mask)),
             spans,
             display_math,
@@ -137,9 +137,10 @@ fn eligible_text(markdown: &str) -> Vec<Range<usize>> {
     for (event, range) in Parser::new_ext(markdown, options).into_offset_iter() {
         match &event {
             Event::Start(Tag::CodeBlock(_)) => code_block_depth += 1,
-            Event::Start(Tag::Link { link_type, .. })
-                if matches!(link_type, LinkType::Autolink | LinkType::Email) =>
-            {
+            Event::Start(Tag::Link {
+                link_type: LinkType::Autolink | LinkType::Email,
+                ..
+            }) => {
                 autolink_depth += 1;
             }
             Event::End(pulldown_cmark::TagEnd::CodeBlock) => {

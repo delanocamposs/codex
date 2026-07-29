@@ -7,17 +7,15 @@ use ratex_types::display_item::DisplayList;
 
 use super::*;
 
-fn encode(image: &RgbaImage) -> Vec<u8> {
+fn encode(image: &RgbaImage) -> image::ImageResult<Vec<u8>> {
     let mut bytes = Vec::new();
-    PngEncoder::new(&mut bytes)
-        .write_image(
-            image.as_raw(),
-            image.width(),
-            image.height(),
-            image::ExtendedColorType::Rgba8,
-        )
-        .expect("encode PNG fixture");
-    bytes
+    PngEncoder::new(&mut bytes).write_image(
+        image.as_raw(),
+        image.width(),
+        image.height(),
+        image::ExtendedColorType::Rgba8,
+    )?;
+    Ok(bytes)
 }
 
 #[test]
@@ -253,12 +251,14 @@ fn png_validation_enforces_bytes_and_dimensions() {
         /*width*/ 2,
         /*height*/ 2,
         Rgba([12, 34, 56, 255]),
-    ));
+    ))
+    .expect("encode visible PNG fixture");
     let oversized_dimensions = encode(&RgbaImage::from_pixel(
         MAX_IMAGE_DIMENSION + 1,
         /*height*/ 1,
         Rgba([12, 34, 56, 255]),
-    ));
+    ))
+    .expect("encode oversized PNG fixture");
     let oversized_bytes = vec![0; MAX_PNG_BYTES + 1];
 
     assert_eq!(

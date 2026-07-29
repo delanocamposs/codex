@@ -530,6 +530,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)]
     fn writes_and_resets_underline_color_metadata_for_kitty_placement_ids() {
         let spans = [Span::from("X").style(Style::new().underline_color(Color::Rgb(1, 2, 3)))];
         let mut actual = Vec::new();

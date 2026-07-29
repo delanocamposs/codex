@@ -3,7 +3,6 @@
 use std::fmt;
 use std::sync::Arc;
 
-use super::RenderRequest;
 use super::RenderedImage;
 use super::RendererInner;
 use super::cache::CacheLookup;
@@ -98,7 +97,7 @@ impl LatexRenderHandle {
         let foreground = latex_foreground();
         let key = RenderKey {
             generation: self.generation,
-            formula: formula.as_str().to_string(),
+            formula,
             foreground,
             style,
             cell_height: cell_pixels.1,
@@ -111,22 +110,13 @@ impl LatexRenderHandle {
         // A font-size change invalidates every raster together. Width remains a layout-only
         // input, so resizes at the same cell height reuse the image.
         state.cache.select_cell_height(cell_pixels.1);
-        let latest_live_admission_id = state.latest_live_admission_id;
-        match state
-            .cache
-            .lookup(&key, self.admission, latest_live_admission_id)
-        {
+        match state.cache.lookup(&key, self.admission) {
             CacheLookup::Ready(image) => return Some(image),
             CacheLookup::Pending => return None,
             CacheLookup::Missing => {}
         }
 
-        if !state.cache.can_admit(
-            &key,
-            self.admission,
-            latest_live_admission_id,
-            self.inner.limits.cache_entry_capacity,
-        ) {
+        if !state.cache.can_admit(&key, self.admission) {
             return None;
         }
 
@@ -135,17 +125,12 @@ impl LatexRenderHandle {
         let request_permit = match self.inner.request_tx.try_reserve() {
             Ok(request_permit) => request_permit,
             Err(_) => {
-                state.admission_retry_generation = Some(self.generation);
+                state.admission_retry_pending = true;
                 return None;
             }
         };
-        state.cache.insert_pending(
-            key.clone(),
-            self.admission,
-            latest_live_admission_id,
-            self.inner.limits.cache_entry_capacity,
-        );
-        request_permit.send(RenderRequest { key, formula });
+        state.cache.insert_pending(key.clone(), self.admission);
+        request_permit.send(key);
         None
     }
 }

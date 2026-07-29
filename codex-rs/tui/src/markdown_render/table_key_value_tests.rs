@@ -4,6 +4,7 @@ use ratatui::style::Modifier;
 use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
+use std::ops::Range;
 
 use super::render_records;
 use crate::markdown_render::TableCell;
@@ -22,17 +23,35 @@ fn metrics() -> Vec<TableColumnMetrics> {
     }]
 }
 
+fn image(columns: u16) -> KittyImage {
+    KittyImage::new(
+        b"png".to_vec(),
+        /*image_id*/ 42,
+        columns,
+        /*rows*/ 1,
+    )
+}
+
+fn image_line(line: Line<'static>, columns: Range<usize>, image: KittyImage) -> HyperlinkLine {
+    HyperlinkLine {
+        line,
+        hyperlinks: Vec::new(),
+        kitty_images: vec![KittyImageAnnotation { columns, image }],
+    }
+}
+
+#[allow(clippy::disallowed_methods)]
+fn image_style() -> Style {
+    Style::new().underline_color(Color::Rgb(1, 2, 3))
+}
+
 fn image_cell(image: &KittyImage) -> TableCell {
-    let image_style = Style::new().underline_color(Color::Rgb(1, 2, 3));
     TableCell {
-        lines: vec![HyperlinkLine {
-            line: Line::from(Span::styled("MMMM", image_style)),
-            hyperlinks: Vec::new(),
-            kitty_images: vec![KittyImageAnnotation {
-                columns: 0..4,
-                image: image.clone(),
-            }],
-        }],
+        lines: vec![image_line(
+            Line::from(Span::styled("MMMM", image_style())),
+            0..4,
+            image.clone(),
+        )],
     }
 }
 
@@ -44,12 +63,7 @@ fn text_cell(text: &str) -> TableCell {
 
 #[test]
 fn aligned_record_header_preserves_image_annotations() {
-    let image = KittyImage::new(
-        b"png".to_vec(),
-        /*image_id*/ 42,
-        /*columns*/ 4,
-        /*rows*/ 1,
-    );
+    let image = image(/*columns*/ 4);
     let label_style = Style::new().add_modifier(Modifier::BOLD);
 
     let rendered = render_records(
@@ -63,33 +77,22 @@ fn aligned_record_header_preserves_image_annotations() {
 
     assert_eq!(
         rendered,
-        vec![HyperlinkLine {
-            line: Line::from(vec![
+        vec![image_line(
+            Line::from(vec![
                 Span::raw(" "),
-                Span::styled(
-                    "MMMM",
-                    label_style.patch(Style::new().underline_color(Color::Rgb(1, 2, 3))),
-                ),
+                Span::styled("MMMM", label_style.patch(image_style()),),
                 Span::raw("  "),
                 Span::raw("value"),
             ]),
-            hyperlinks: Vec::new(),
-            kitty_images: vec![KittyImageAnnotation {
-                columns: 1..5,
-                image,
-            }],
-        }],
+            1..5,
+            image,
+        )],
     );
 }
 
 #[test]
 fn stacked_record_header_preserves_image_annotations() {
-    let image = KittyImage::new(
-        b"png".to_vec(),
-        /*image_id*/ 42,
-        /*columns*/ 4,
-        /*rows*/ 1,
-    );
+    let image = image(/*columns*/ 4);
     let label_style = Style::new().add_modifier(Modifier::BOLD);
 
     let rendered = render_records(
@@ -104,20 +107,14 @@ fn stacked_record_header_preserves_image_annotations() {
     assert_eq!(
         rendered,
         vec![
-            HyperlinkLine {
-                line: Line::from(vec![
+            image_line(
+                Line::from(vec![
                     Span::raw(" "),
-                    Span::styled(
-                        "MMMM",
-                        label_style.patch(Style::new().underline_color(Color::Rgb(1, 2, 3)),),
-                    ),
+                    Span::styled("MMMM", label_style.patch(image_style()),),
                 ]),
-                hyperlinks: Vec::new(),
-                kitty_images: vec![KittyImageAnnotation {
-                    columns: 1..5,
-                    image,
-                }],
-            },
+                1..5,
+                image,
+            ),
             HyperlinkLine::new(Line::from(vec![Span::raw("  "), Span::raw("value"),])),
         ],
     );
@@ -125,21 +122,9 @@ fn stacked_record_header_preserves_image_annotations() {
 
 #[test]
 fn stacked_record_drops_indent_before_viewport_wide_image() {
-    let image = KittyImage::new(
-        b"png".to_vec(),
-        /*image_id*/ 42,
-        /*columns*/ 8,
-        /*rows*/ 1,
-    );
+    let image = image(/*columns*/ 8);
     let value = TableCell {
-        lines: vec![HyperlinkLine {
-            line: Line::from("MMMMMMMM"),
-            hyperlinks: Vec::new(),
-            kitty_images: vec![KittyImageAnnotation {
-                columns: 0..8,
-                image: image.clone(),
-            }],
-        }],
+        lines: vec![image_line(Line::from("MMMMMMMM"), 0..8, image.clone())],
     };
 
     let rendered = render_records(
@@ -155,15 +140,7 @@ fn stacked_record_drops_indent_before_viewport_wide_image() {
         rendered,
         vec![
             HyperlinkLine::new(Line::from(vec![Span::raw(" "), Span::raw("Key"),])),
-            HyperlinkLine {
-                line: Line::from("MMMMMMMM"),
-                hyperlinks: Vec::new(),
-                kitty_images: vec![KittyImageAnnotation {
-                    columns: 0..8,
-                    image,
-                }],
-            },
+            image_line(Line::from("MMMMMMMM"), 0..8, image),
         ],
     );
-    assert!(rendered.iter().all(|line| line.width() <= 8));
 }

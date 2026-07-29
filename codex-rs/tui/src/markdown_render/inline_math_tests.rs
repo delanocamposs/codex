@@ -6,7 +6,7 @@ use super::InlineMathText;
 use crate::inline_math::InlineMathSpan;
 
 #[test]
-fn substitutes_validated_spans_without_cloning_them() {
+fn substitutes_validated_spans_in_order() {
     let source = r"before \(x\) after";
     let raw = r"\(x\)";
     let start = source.find(raw).expect("fixture contains inline math");

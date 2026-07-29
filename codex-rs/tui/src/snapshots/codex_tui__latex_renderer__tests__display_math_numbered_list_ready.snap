@@ -1,0 +1,39 @@
+---
+source: tui/src/latex_renderer_tests.rs
+expression: snapshot
+---
+[literal fallback]
+• 1. Mass-energy equivalence
+     \[
+       E=mc^2
+     \]
+
+     \[
+     p=mv
+     \]
+     Probably the world's most
+     recognizable physics
+     equation.
+
+  2. Pythagorean theorem
+     \[
+     a^2+b^2=c^2
+     \]
+
+  3. \[
+     F=ma
+     \]
+
+[ready]
+• 1. Mass-energy equivalence
+     ▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧ [Kitty image]
+
+     ▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧ [Kitty image]
+     Probably the world's most
+     recognizable physics
+     equation.
+
+  2. Pythagorean theorem
+     ▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧ [Kitty image]
+
+  3. ▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧▧ [Kitty image]

@@ -460,6 +460,77 @@ async fn completed_display_math_has_a_visual_snapshot_and_literal_transcript() {
 }
 
 #[tokio::test]
+async fn display_math_inside_numbered_items_keeps_labels_and_continuation_indent() {
+    let source = concat!(
+        "1. **Mass-energy equivalence**\n",
+        "   \\[\n",
+        "     E=mc^2\n",
+        "   \\]\n",
+        "   \\[\n",
+        "   p=mv\n",
+        "   \\]\n",
+        "   Probably the world's most recognizable physics equation.\n\n",
+        "2. **Pythagorean theorem**\n",
+        "   \\[\n",
+        "   a^2+b^2=c^2\n",
+        "   \\]\n\n",
+        "3.\n",
+        "   \\[\n",
+        "   F=ma\n",
+        "   \\]",
+    );
+    let wide_render: Arc<RenderFn> = Arc::new(|_, _, _, _| {
+        Ok(LatexPng {
+            bytes: Arc::from([1, 2, 3]),
+            width: 400,
+            height: 8,
+        })
+    });
+    let (renderer, mut event_rx) =
+        start_test_renderer(wide_render, test_limits(/*cache_entry_capacity*/ 4));
+    let cell = AgentMarkdownCell::new(source.to_string(), std::path::Path::new("/tmp"))
+        .with_latex_renderer(renderer.handle());
+
+    let pending = cell.display_hyperlink_lines(/*width*/ 32);
+    assert_eq!(next_render_generation(&mut event_rx).await, 1);
+    assert_eq!(next_render_generation(&mut event_rx).await, 1);
+    assert_eq!(next_render_generation(&mut event_rx).await, 1);
+    assert_eq!(next_render_generation(&mut event_rx).await, 1);
+    let ready = cell.display_hyperlink_lines(/*width*/ 32);
+    assert_eq!(cell.transcript_hyperlink_lines(/*width*/ 32), pending);
+    assert_eq!(ready.iter().map(|line| line.line.width()).max(), Some(32),);
+    let mut image_ids = ready
+        .iter()
+        .flat_map(|line| &line.kitty_images)
+        .map(|annotation| annotation.image.image_id())
+        .collect::<Vec<_>>();
+    image_ids.sort_unstable();
+    image_ids.dedup();
+    assert_eq!(image_ids.len(), 4);
+
+    let snapshot_lines = |lines: &[HyperlinkLine]| {
+        lines
+            .iter()
+            .map(|line| {
+                let text = normalized_placeholder_text(line);
+                if line.kitty_images.is_empty() {
+                    text
+                } else {
+                    format!("{text} [Kitty image]")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let snapshot = format!(
+        "[literal fallback]\n{}\n\n[ready]\n{}",
+        snapshot_lines(&pending),
+        snapshot_lines(&ready),
+    );
+    assert_snapshot!("display_math_numbered_list_ready", snapshot);
+}
+
+#[tokio::test]
 async fn completed_inline_math_has_a_one_row_visual_snapshot_and_literal_transcript() {
     let source = r"Given \(x\in\ker f''\), continue.";
     let (renderer, mut event_rx) =

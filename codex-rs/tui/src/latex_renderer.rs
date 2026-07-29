@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
@@ -20,9 +20,11 @@ use crate::latex_image::ValidatedLatexFormula;
 mod cache;
 mod kitty_placeholder;
 mod render_handle;
+use cache::CacheCompletion;
 use cache::RenderAdmission;
 use cache::RenderCache;
 use cache::RenderKey;
+#[cfg(test)]
 use kitty_placeholder::next_image_id;
 pub(crate) use render_handle::LatexRenderHandle;
 
@@ -64,15 +66,19 @@ impl RenderedImage {
     #[cfg(test)]
     fn new(png: LatexPng) -> Option<Self> {
         let terminal_bytes = Self::terminal_bytes(&png)?;
-        Self::new_with_terminal_bytes(png, terminal_bytes)
+        Some(Self::new_with_terminal_bytes(
+            png,
+            terminal_bytes,
+            next_image_id()?,
+        ))
     }
 
-    fn new_with_terminal_bytes(png: LatexPng, terminal_bytes: usize) -> Option<Self> {
-        Some(Self {
+    fn new_with_terminal_bytes(png: LatexPng, terminal_bytes: usize, image_id: u32) -> Self {
+        Self {
             png,
-            image_id: next_image_id()?,
+            image_id,
             terminal_bytes,
-        })
+        }
     }
 
     fn terminal_bytes(png: &LatexPng) -> Option<usize> {
@@ -81,33 +87,15 @@ impl RenderedImage {
     }
 }
 
-struct RenderRequest {
-    key: RenderKey,
-    formula: ValidatedLatexFormula,
-}
-
 type RenderFn = dyn Fn(&ValidatedLatexFormula, LatexRenderStyle, [u8; 3], u32) -> Result<LatexPng, LatexImageError>
     + Send
     + Sync;
 
 struct RendererState {
     generation: u64,
-    latest_live_admission_id: u64,
-    admission_retry_generation: Option<u64>,
+    admission_retry_pending: bool,
     rendering_disabled: bool,
     cache: RenderCache,
-}
-
-impl Default for RendererState {
-    fn default() -> Self {
-        Self {
-            generation: 1,
-            latest_live_admission_id: 0,
-            admission_retry_generation: None,
-            rendering_disabled: false,
-            cache: RenderCache::default(),
-        }
-    }
 }
 
 struct RendererInner {
@@ -115,7 +103,7 @@ struct RendererInner {
     app_event_tx: mpsc::UnboundedSender<AppEvent>,
     render: Arc<RenderFn>,
     limits: RendererLimits,
-    request_tx: mpsc::Sender<RenderRequest>,
+    request_tx: mpsc::Sender<RenderKey>,
 }
 
 /// Owns the render generation and bounded cache for one app transcript.
@@ -151,35 +139,40 @@ impl LatexRenderer {
         let runtime = tokio::runtime::Handle::try_current().ok()?;
         let (request_tx, request_rx) = mpsc::channel(limits.cache_entry_capacity);
         let inner = Arc::new(RendererInner {
-            state: Mutex::new(RendererState::default()),
+            state: Mutex::new(RendererState {
+                generation: 1,
+                admission_retry_pending: false,
+                rendering_disabled: false,
+                cache: RenderCache::new(limits),
+            }),
             app_event_tx,
             render,
             limits,
             request_tx,
         });
-        let request_rx = Arc::new(AsyncMutex::new(request_rx));
-        for _ in 0..limits.worker_count {
-            let inner = Arc::downgrade(&inner);
-            let request_rx = Arc::clone(&request_rx);
-            std::mem::drop(runtime.spawn(async move {
-                loop {
-                    let request = {
-                        let mut request_rx = request_rx.lock().await;
-                        request_rx.recv().await
-                    };
-                    let Some(request) = request else {
-                        return;
-                    };
-                    let Some(inner) = inner.upgrade() else {
-                        return;
-                    };
-                    // A stale queued request emits no completion after reset, so receiving it
-                    // must still wake the current generation if it observed a full queue.
-                    inner.notify_admission_retry();
+        let inner_weak = Arc::downgrade(&inner);
+        std::mem::drop(runtime.spawn(async move {
+            let workers = Arc::new(Semaphore::new(limits.worker_count));
+            let mut request_rx = request_rx;
+            loop {
+                let Ok(worker) = Arc::clone(&workers).acquire_owned().await else {
+                    return;
+                };
+                let Some(request) = request_rx.recv().await else {
+                    return;
+                };
+                let Some(inner) = inner_weak.upgrade() else {
+                    return;
+                };
+                // A stale queued request emits no completion after reset, so receiving it
+                // must still wake the current generation if it observed a full queue.
+                inner.notify_admission_retry();
+                std::mem::drop(tokio::spawn(async move {
                     inner.render_request(request).await;
-                }
-            }));
-        }
+                    drop(worker);
+                }));
+            }
+        }));
         Some(Self { inner })
     }
 
@@ -195,11 +188,8 @@ impl LatexRenderer {
     pub(crate) fn live_handle(&self) -> LatexRenderHandle {
         let (generation, admission) = {
             let mut state = self.inner.state();
-            state.latest_live_admission_id = state.latest_live_admission_id.wrapping_add(1);
-            let admission_id = state.latest_live_admission_id;
-            let admission = RenderAdmission::Live(admission_id);
-            state.cache.begin_live_admission();
-            (state.generation, admission)
+            let generation = state.generation;
+            (generation, state.cache.begin_live_admission())
         };
         LatexRenderHandle::new(Arc::clone(&self.inner), generation, admission)
     }
@@ -211,7 +201,7 @@ impl LatexRenderer {
     pub(crate) fn reset(&self) {
         let mut state = self.inner.state();
         state.generation = state.generation.wrapping_add(1);
-        state.admission_retry_generation = None;
+        state.admission_retry_pending = false;
         state.cache.clear();
     }
 }
@@ -226,54 +216,50 @@ impl RendererInner {
     fn notify_admission_retry(&self) {
         let generation = {
             let mut state = self.state();
-            let active_generation = state.generation;
-            state
-                .admission_retry_generation
-                .take()
-                .filter(|generation| *generation == active_generation)
+            if !state.admission_retry_pending {
+                return;
+            }
+            state.admission_retry_pending = false;
+            state.generation
         };
-        if let Some(generation) = generation {
-            self.notify_updated(generation);
-        }
+        self.notify_updated(generation);
     }
 
-    async fn render_request(&self, request: RenderRequest) {
+    async fn render_request(&self, key: RenderKey) {
         {
             let mut state = self.state();
-            if state.generation != request.key.generation
-                || !state.cache.contains_pending(&request.key)
-            {
+            if state.generation != key.generation || !state.cache.contains_pending(&key) {
                 return;
             }
             if state.rendering_disabled {
-                state.cache.discard_pending(&request.key);
+                state.cache.discard_pending(&key);
                 return;
             }
         }
 
         let render = Arc::clone(&self.render);
-        let formula = request.formula;
-        let foreground = request.key.foreground;
-        let style = request.key.style;
-        let cell_height = request.key.cell_height;
+        let formula = key.formula.clone();
+        let foreground = key.foreground;
+        let style = key.style;
+        let cell_height = key.cell_height;
         let mut render_task =
             tokio::task::spawn_blocking(move || render(&formula, style, foreground, cell_height));
         match timeout(self.limits.render_timeout, &mut render_task).await {
-            Ok(Ok(Ok(png))) => self.finish_success(request.key, png),
+            Ok(Ok(Ok(png))) => self.finish_success(key, png),
             Ok(Ok(Err(error))) => {
                 tracing::debug!(%error, "LaTeX rendering failed");
-                self.finish_failure(request.key);
+                self.finish_failure(key);
             }
             Ok(Err(error)) => {
                 tracing::debug!(%error, "LaTeX worker failed");
-                self.finish_failure(request.key);
+                self.finish_failure(key);
             }
             Err(_) => {
                 // Blocking tasks cannot be cancelled safely. Disable this renderer after the
                 // first timeout so at most one task per worker can remain detached.
                 render_task.abort();
                 tracing::warn!("LaTeX rendering timed out; disabling image rendering");
-                self.disable_rendering(request.key.generation);
+                self.disable_rendering(key.generation);
             }
         }
     }
@@ -299,14 +285,17 @@ impl RendererInner {
                 state.cache.discard_pending(&key);
                 return;
             }
-            let latest_live_admission_id = state.latest_live_admission_id;
-            state.cache.complete(
-                &key,
-                png,
-                terminal_bytes,
-                latest_live_admission_id,
-                self.limits,
-            )
+            match state.cache.complete(&key, png, terminal_bytes) {
+                CacheCompletion::Missing => false,
+                CacheCompletion::Updated => true,
+                CacheCompletion::ImageIdExhausted => {
+                    tracing::warn!("LaTeX image IDs exhausted; disabling image rendering");
+                    state.rendering_disabled = true;
+                    state.admission_retry_pending = false;
+                    state.cache.clear();
+                    true
+                }
+            }
         };
         if updated {
             self.notify_updated(key.generation);
@@ -319,8 +308,7 @@ impl RendererInner {
             if state.generation != key.generation || state.rendering_disabled {
                 return;
             }
-            let latest_live_admission_id = state.latest_live_admission_id;
-            state.cache.fail(&key, latest_live_admission_id)
+            state.cache.fail(&key)
         };
         if updated {
             self.notify_updated(key.generation);
@@ -334,7 +322,7 @@ impl RendererInner {
                 return;
             }
             state.rendering_disabled = true;
-            state.admission_retry_generation = None;
+            state.admission_retry_pending = false;
             state.cache.clear();
         }
         self.notify_updated(generation);

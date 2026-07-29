@@ -1063,6 +1063,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)]
     fn terminal_draw_preserves_and_resets_underline_color_metadata() {
         let mut expected = Vec::new();
         let mut terminal =

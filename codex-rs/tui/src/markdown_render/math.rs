@@ -13,7 +13,6 @@ use crate::terminal_hyperlinks::HyperlinkLine;
 use pulldown_cmark::Event;
 use pulldown_cmark::Options;
 use pulldown_cmark::Parser;
-use pulldown_cmark::TagEnd;
 use ratatui::text::Line;
 use std::ops::Range;
 use std::path::Path;
@@ -54,7 +53,8 @@ pub(crate) fn render_markdown_lines(
         is_hidden_link_destination,
         InlineMathCursor::new(input, inline_math_mask, inline_math_spans),
     );
-    writer.latex_renderer = latex_renderer.map(|renderer| renderer.for_render_pass());
+    writer.latex_renderer =
+        latex_renderer.map(crate::latex_renderer::LatexRenderHandle::for_render_pass);
     if !writer.run(display_math) {
         return render_literal_lines(input, width);
     }
@@ -86,25 +86,37 @@ where
         display_math: Vec<crate::display_math::DisplayMathSpan<'a>>,
     ) -> bool {
         let mut display_math = display_math.into_iter().peekable();
+        let mut active_display_math = None;
         while let Some((event, range)) = self.iter.next() {
-            let is_display_math = matches!(&event, Event::Start(pulldown_cmark::Tag::Paragraph))
+            let is_display_math_content = matches!(
+                &event,
+                Event::Text(_)
+                    | Event::Code(_)
+                    | Event::SoftBreak
+                    | Event::HardBreak
+                    | Event::InlineHtml(_)
+            );
+            if is_display_math_content
+                && active_display_math
+                    .as_ref()
+                    .is_some_and(|active: &Range<usize>| {
+                        (range.start < active.end && active.start < range.end)
+                            || (range.start == active.end
+                                && matches!(&event, Event::SoftBreak | Event::HardBreak))
+                    })
+            {
+                continue;
+            }
+            active_display_math = None;
+            if is_display_math_content
                 && display_math.peek().is_some_and(|span| {
-                    range.start <= span.source_range.start
-                        && span.source_range.end <= range.end
-                        && self
-                            .input
-                            .get(range.clone())
-                            .is_some_and(|paragraph| paragraph.trim() == span.raw_block)
-                });
-            if is_display_math {
-                let span = display_math
-                    .next()
-                    .expect("the display-math span was just validated");
-                for (paragraph_event, _) in self.iter.by_ref() {
-                    if matches!(paragraph_event, Event::End(TagEnd::Paragraph)) {
-                        break;
-                    }
-                }
+                    range.start < span.source_range.end && span.source_range.start < range.end
+                })
+            {
+                let Some(span) = display_math.next() else {
+                    return false;
+                };
+                active_display_math = Some(span.source_range.clone());
                 self.display_math_block(span.raw_block, span.formula);
                 continue;
             }
@@ -119,34 +131,65 @@ where
     }
 
     fn display_math_block(&mut self, raw_block: &str, formula: &str) {
+        let reuse_empty_line = !self.needs_newline
+            && self.current_line_content.as_ref().is_some_and(|line| {
+                line.line.spans.is_empty()
+                    && line.hyperlinks.is_empty()
+                    && line.kitty_images.is_empty()
+            });
         let rendered = self.latex_renderer.as_ref().and_then(|renderer| {
             renderer.render(
                 formula,
-                self.wrap_width
-                    .and_then(|width| u16::try_from(width).ok())
-                    .unwrap_or(/*default*/ 80),
+                u16::try_from(self.max_text_math_columns()).unwrap_or(u16::MAX),
             )
         });
 
-        self.flush_current_line();
+        if !reuse_empty_line {
+            self.flush_current_line();
+        }
         if self.needs_newline {
             self.push_blank_line();
         }
         if let Some(lines) = rendered {
-            for line in lines {
-                self.push_hyperlink_line(line);
+            for (index, line) in lines.into_iter().enumerate() {
+                if reuse_empty_line && index == 0 {
+                    self.push_annotated(line);
+                } else {
+                    self.push_hyperlink_line(line);
+                }
                 self.flush_current_line();
             }
         } else {
-            for line in raw_block.split('\n') {
-                self.push_line(Line::from(
-                    line.strip_suffix('\r').unwrap_or(line).to_string(),
-                ));
+            let structural_indent = raw_block
+                .rsplit('\n')
+                .next()
+                .unwrap_or_default()
+                .bytes()
+                .take_while(|byte| matches!(byte, b' ' | b'\t'))
+                .count();
+            for (index, line) in raw_block.split('\n').enumerate() {
+                let line = line.strip_suffix('\r').unwrap_or(line);
+                let line = if index == 0 {
+                    line
+                } else {
+                    line.get(structural_indent..)
+                        .filter(|_| {
+                            line.as_bytes()[..structural_indent]
+                                .iter()
+                                .all(|byte| matches!(byte, b' ' | b'\t'))
+                        })
+                        .unwrap_or(line)
+                };
+                let line = Line::from(line.to_string());
+                if reuse_empty_line && index == 0 {
+                    self.current_line_content = Some(HyperlinkLine::new(line));
+                } else {
+                    self.push_line(line);
+                }
                 self.flush_current_line();
             }
         }
         self.needs_newline = true;
-        self.in_paragraph = false;
         self.pending_marker_line = false;
     }
 
@@ -208,21 +251,7 @@ where
             });
             (table_width / column_count).max(1)
         } else {
-            let indentation = self
-                .current_initial_indent
-                .iter()
-                .map(|span| crate::width::display_width(span.content.as_ref()))
-                .sum::<usize>()
-                .max(
-                    self.current_subsequent_indent
-                        .iter()
-                        .map(|span| crate::width::display_width(span.content.as_ref()))
-                        .sum(),
-                );
-            self.wrap_width
-                .unwrap_or(/*default*/ 80)
-                .saturating_sub(indentation)
-                .max(1)
+            self.max_text_math_columns()
         };
         let rendered = self.latex_renderer.as_ref().and_then(|renderer| {
             renderer.render_inline(
@@ -241,5 +270,20 @@ where
         } else {
             self.push_decoded_text(&span.raw);
         }
+    }
+
+    fn max_text_math_columns(&self) -> usize {
+        let indentation = if self.current_line_content.is_some() {
+            Self::spans_display_width(&self.current_initial_indent)
+                .max(Self::spans_display_width(&self.current_subsequent_indent))
+        } else {
+            Self::spans_display_width(&self.prefix_spans(self.pending_marker_line)).max(
+                Self::spans_display_width(&self.prefix_spans(/*pending_marker_line*/ false)),
+            )
+        };
+        self.wrap_width
+            .unwrap_or(/*default*/ 80)
+            .saturating_sub(indentation)
+            .max(1)
     }
 }
