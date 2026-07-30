@@ -1,5 +1,5 @@
 ---
 source: tui/src/latex_renderer_tests.rs
-expression: snapshot
+expression: image_snapshot(&rendered)
 ---
-• Given ▧▧▧▧▧, continue.
+• Given x∈ker f″, continue.

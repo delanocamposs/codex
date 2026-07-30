@@ -580,30 +580,21 @@ async fn display_math_inside_blockquote_keeps_quote_layout() {
 }
 
 #[tokio::test]
-async fn completed_inline_math_has_a_one_row_visual_snapshot_and_literal_transcript() {
+async fn simple_inline_math_uses_unicode_without_scheduling_an_image() {
     let source = r"Given \(x\in\ker f''\), continue.";
-    let (renderer, mut event_rx) =
+    let (renderer, event_rx) =
         start_test_renderer(immediate_render(), test_limits(/*cache_entry_capacity*/ 2));
     let cell = AgentMarkdownCell::new(source.to_string(), std::path::Path::new("/tmp"))
         .with_latex_renderer(renderer.handle());
 
-    let pending = cell.display_hyperlink_lines(/*width*/ 48);
-    assert_eq!(next_render_generation(&mut event_rx).await, 1);
-    let ready = cell.display_hyperlink_lines(/*width*/ 48);
-    let image = ready
-        .iter()
-        .flat_map(|line| &line.kitty_images)
-        .next()
-        .expect("inline image should be ready");
-    assert_eq!(image.image.rows(), 1);
-    assert_eq!(cell.transcript_hyperlink_lines(/*width*/ 48), pending);
-
-    let snapshot = ready
-        .iter()
-        .map(normalized_placeholder_text)
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert_snapshot!("inline_math_agent_cell_ready", snapshot);
+    let rendered = cell.display_hyperlink_lines(/*width*/ 48);
+    assert!(rendered.iter().all(|line| line.kitty_images.is_empty()));
+    assert!(event_rx.is_empty());
+    assert_eq!(
+        image_snapshot(&cell.transcript_hyperlink_lines(/*width*/ 48)),
+        r"• Given \(x\in\ker f''\), continue.",
+    );
+    assert_snapshot!("inline_math_agent_cell_ready", image_snapshot(&rendered),);
 }
 
 #[tokio::test]
@@ -666,10 +657,8 @@ async fn inline_math_table_snapshot_excludes_code_and_renders_link_labels() {
             .all(|line| line.kitty_images.is_empty()),
     );
     assert_eq!(next_render_generation(&mut event_rx).await, 1);
-    assert_eq!(next_render_generation(&mut event_rx).await, 1);
-    assert_eq!(next_render_generation(&mut event_rx).await, 1);
     let ready = cell.display_hyperlink_lines(/*width*/ 100);
-    assert_eq!(ready.iter().flat_map(|line| &line.kitty_images).count(), 3);
+    assert_eq!(ready.iter().flat_map(|line| &line.kitty_images).count(), 1);
     assert!(
         ready
             .iter()

@@ -7,7 +7,9 @@ use super::Writer;
 use super::inline_math::InlineMathCursor;
 use super::inline_math::InlineMathSegment;
 use super::inline_math::InlineMathText;
+use super::inline_math_unicode;
 use super::word_wrap_hyperlink_line;
+use crate::latex_image::AdmissibleLatexFormula;
 use crate::markdown_text_merge::DecodedTextMerge;
 use crate::terminal_hyperlinks::HyperlinkLine;
 use crate::terminal_hyperlinks::TerminalHyperlink;
@@ -227,6 +229,14 @@ where
             !self.in_code_block,
             "the source parser must not accept math inside code"
         );
+        if self.latex_renderer.is_some()
+            && let Some(rendered) = AdmissibleLatexFormula::new(formula)
+                .ok()
+                .and_then(|formula| inline_math_unicode::render(formula.as_str()))
+        {
+            self.push_decoded_text(&rendered);
+            return;
+        }
         let in_table_cell = self.in_table_cell();
         let max_columns = if in_table_cell {
             let column_count = self

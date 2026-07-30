@@ -75,6 +75,7 @@ use std::sync::LazyLock;
 use url::Url;
 
 mod inline_math;
+mod inline_math_unicode;
 mod math;
 mod streaming;
 mod table_key_value;

@@ -221,7 +221,7 @@ async fn cached_display_math_reflows_immediately_when_stream_is_consolidated() -
 }
 
 #[tokio::test]
-async fn resumed_math_stays_literal_until_tail_replay_renders_display_and_inline() -> Result<()> {
+async fn resumed_math_renders_inline_immediately_and_display_after_tail_replay() -> Result<()> {
     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
     let generation = install_test_latex_renderer(&mut app);
     let mut tui = crate::tui::test_support::make_test_tui()?;
@@ -241,17 +241,17 @@ async fn resumed_math_stays_literal_until_tail_replay_renders_display_and_inline
         .iter()
         .position(|cell| cell.as_any().is::<AgentMarkdownCell>())
         .expect("resume should consolidate the agent message into a source-backed cell");
-    let literal = app.transcript_cells[agent_cell_index]
+    let initial = app.transcript_cells[agent_cell_index]
         .display_hyperlink_lines(/*width*/ DISPLAY_WIDTH);
-    let literal_text = literal
+    let initial_text = initial
         .iter()
         .map(|line| line.line.to_string())
         .collect::<String>();
     assert_eq!(
         (
-            has_image(&literal),
-            literal_text.contains("$$"),
-            literal_text.contains(r"\(y^2\)"),
+            has_image(&initial),
+            initial_text.contains("$$"),
+            initial_text.contains("y²"),
         ),
         (false, true, true),
     );
@@ -281,7 +281,7 @@ async fn resumed_math_stays_literal_until_tail_replay_renders_display_and_inline
                 .collect::<Vec<_>>();
             image_ids.sort_unstable();
             image_ids.dedup();
-            if image_ids.len() == 2 {
+            if image_ids.len() == 1 {
                 break;
             }
         }
