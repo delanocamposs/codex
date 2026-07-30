@@ -3,54 +3,17 @@ use std::time::Duration;
 use pretty_assertions::assert_eq;
 
 use super::*;
-use crate::app::session_lifecycle::ThreadAttachPresentation;
-use crate::app::session_lifecycle::ThreadUiReset;
-use crate::insert_history::HistoryLineWrapPolicy;
 use crate::terminal_hyperlinks::HyperlinkLine;
-use crate::terminal_hyperlinks::KittyImageAnnotation;
 
 const DISPLAY_WIDTH: u16 = 48;
 const EVENT_TIMEOUT: Duration = Duration::from_secs(1);
 
-#[derive(Debug)]
-struct WidthBoundImageCell;
-
-impl HistoryCell for WidthBoundImageCell {
-    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        vec![Line::from("\u{10eeee}".repeat(usize::from(width)))]
-    }
-
-    fn raw_lines(&self) -> Vec<Line<'static>> {
-        vec![Line::from("$$ source $$")]
-    }
-
-    fn display_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
-        let mut line = HyperlinkLine::new(Line::from("\u{10eeee}".repeat(usize::from(width))));
-        line.kitty_images.push(KittyImageAnnotation {
-            columns: 0..usize::from(width),
-            image: crate::terminal_image::KittyImage::new(
-                b"png".to_vec(),
-                /*image_id*/ 42,
-                width,
-                /*rows*/ 1,
-            ),
-        });
-        vec![line]
-    }
-}
-
 fn install_test_latex_renderer(app: &mut App) -> u64 {
-    app.latex_renderer = Some(crate::latex_renderer::LatexRenderer::new_for_tests(
-        app.app_event_tx.app_event_tx.clone(),
-    ));
-    latex_generation(app)
-}
-
-fn latex_generation(app: &App) -> u64 {
-    app.latex_renderer
-        .as_ref()
-        .expect("display-math renderer should be installed")
-        .generation()
+    let renderer =
+        crate::latex_renderer::LatexRenderer::new_for_tests(app.app_event_tx.app_event_tx.clone());
+    let generation = renderer.generation();
+    app.latex_renderer = Some(renderer);
+    generation
 }
 
 fn has_image(lines: &[HyperlinkLine]) -> bool {
@@ -105,25 +68,6 @@ async fn finish_initial_replay(
             break;
         }
     }
-}
-
-async fn replace_with_empty_thread(
-    app: &mut App,
-    tui: &mut crate::tui::Tui,
-    ui_reset: ThreadUiReset,
-) -> Result<()> {
-    app.replace_chat_widget_with_app_server_thread(
-        tui,
-        AppServerStartedThread {
-            session: test_thread_session(ThreadId::new(), app.config.cwd.to_path_buf()),
-            turns: Vec::new(),
-            blocks_direct_input: false,
-        },
-        ThreadAttachPresentation::SessionLineage,
-        ui_reset,
-        /*initial_user_message*/ None,
-    )
-    .await
 }
 
 #[tokio::test]
@@ -345,48 +289,6 @@ async fn resumed_math_stays_literal_until_tail_replay_renders_display_and_inline
 
     assert!(app.transcript_reflow.has_pending_reflow());
     app_server.shutdown().await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn latex_renderer_resets_once_for_clear_and_again_for_thread_switch() -> Result<()> {
-    let mut app = make_test_app().await;
-    let initial_generation = install_test_latex_renderer(&mut app);
-    let mut tui = crate::tui::test_support::make_test_tui()?;
-
-    app.reset_app_ui_state_after_clear();
-    assert_eq!(latex_generation(&app), initial_generation + 1);
-
-    replace_with_empty_thread(&mut app, &mut tui, ThreadUiReset::AlreadyCleared).await?;
-    assert_eq!(latex_generation(&app), initial_generation + 1);
-
-    replace_with_empty_thread(&mut app, &mut tui, ThreadUiReset::Required).await?;
-    assert_eq!(latex_generation(&app), initial_generation + 2);
-    Ok(())
-}
-
-#[tokio::test]
-async fn overwide_pending_image_reflows_from_source_before_retrying() -> Result<()> {
-    let mut app = make_test_app().await;
-    app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Disabled;
-    let cell = Arc::new(WidthBoundImageCell);
-    app.transcript_cells = vec![cell.clone()];
-    let mut tui = crate::tui::test_support::make_test_tui()?;
-    let terminal_width = tui.terminal.size()?.width;
-    let stale_width = terminal_width + 1;
-
-    tui.insert_history_hyperlink_lines_with_wrap_policy(
-        cell.display_hyperlink_lines(stale_width),
-        HistoryLineWrapPolicy::PreWrap,
-    );
-    tui.draw_with_resize_reflow(/*height*/ 1, |_| {})?;
-
-    app.handle_draw_pre_render(&mut tui)?;
-    assert!(app.has_emitted_history_lines);
-    assert!(!app.transcript_reflow.has_pending_reflow());
-
-    tui.draw_with_resize_reflow(/*height*/ 1, |_| {})?;
-    assert!(!tui.take_history_source_reflow_needed());
     Ok(())
 }
 

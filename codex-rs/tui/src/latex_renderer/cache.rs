@@ -13,7 +13,7 @@ pub(super) const NEGATIVE_KEY_CAPACITY: usize = 64;
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct RenderKey {
     pub(super) generation: u64,
-    pub(super) formula: crate::latex_image::ValidatedLatexFormula,
+    pub(super) formula: crate::latex_image::AdmissibleLatexFormula,
     pub(super) foreground: [u8; 3],
     pub(super) style: LatexRenderStyle,
     pub(super) cell_height: u32,
@@ -68,9 +68,6 @@ impl BoundedKeyMemory {
     }
 
     fn record(&mut self, key: &RenderKey) {
-        if self.contains(key) {
-            return;
-        }
         if self.keys.len() == NEGATIVE_KEY_CAPACITY {
             self.exhausted = true;
         } else {
@@ -241,11 +238,11 @@ impl RenderCache {
             self.bytes += png_bytes;
             self.terminal_bytes += terminal_bytes;
             entry.admission = admission;
-            entry.state = RenderState::Ready(Arc::new(RenderedImage::new_with_terminal_bytes(
+            entry.state = RenderState::Ready(Arc::new(RenderedImage {
                 png,
-                terminal_bytes,
                 image_id,
-            )));
+                terminal_bytes,
+            }));
         } else {
             self.remove_entry(key);
             match admission {
@@ -272,12 +269,6 @@ impl RenderCache {
             self.live_rejections.record(key);
         }
         true
-    }
-
-    pub(super) fn discard_pending(&mut self, key: &RenderKey) {
-        if self.contains_pending(key) {
-            self.remove_entry(key);
-        }
     }
 
     pub(super) fn clear(&mut self) {

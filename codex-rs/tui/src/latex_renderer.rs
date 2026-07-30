@@ -12,10 +12,10 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use crate::app_event::AppEvent;
+use crate::latex_image::AdmissibleLatexFormula;
 use crate::latex_image::LatexImageError;
 use crate::latex_image::LatexPng;
 use crate::latex_image::LatexRenderStyle;
-use crate::latex_image::ValidatedLatexFormula;
 
 mod cache;
 mod kitty_placeholder;
@@ -24,8 +24,6 @@ use cache::CacheCompletion;
 use cache::RenderAdmission;
 use cache::RenderCache;
 use cache::RenderKey;
-#[cfg(test)]
-use kitty_placeholder::next_image_id;
 pub(crate) use render_handle::LatexRenderHandle;
 
 const WORKER_COUNT: usize = 2;
@@ -63,31 +61,13 @@ struct RenderedImage {
 }
 
 impl RenderedImage {
-    #[cfg(test)]
-    fn new(png: LatexPng) -> Option<Self> {
-        let terminal_bytes = Self::terminal_bytes(&png)?;
-        Some(Self::new_with_terminal_bytes(
-            png,
-            terminal_bytes,
-            next_image_id()?,
-        ))
-    }
-
-    fn new_with_terminal_bytes(png: LatexPng, terminal_bytes: usize, image_id: u32) -> Self {
-        Self {
-            png,
-            image_id,
-            terminal_bytes,
-        }
-    }
-
     fn terminal_bytes(png: &LatexPng) -> Option<usize> {
         let pixels = u64::from(png.width).checked_mul(u64::from(png.height))?;
         usize::try_from(pixels.checked_mul(4)?).ok()
     }
 }
 
-type RenderFn = dyn Fn(&ValidatedLatexFormula, LatexRenderStyle, [u8; 3], u32) -> Result<LatexPng, LatexImageError>
+type RenderFn = dyn Fn(&AdmissibleLatexFormula, LatexRenderStyle, [u8; 3], u32) -> Result<LatexPng, LatexImageError>
     + Send
     + Sync;
 
@@ -227,12 +207,8 @@ impl RendererInner {
 
     async fn render_request(&self, key: RenderKey) {
         {
-            let mut state = self.state();
+            let state = self.state();
             if state.generation != key.generation || !state.cache.contains_pending(&key) {
-                return;
-            }
-            if state.rendering_disabled {
-                state.cache.discard_pending(&key);
                 return;
             }
         }
@@ -265,24 +241,13 @@ impl RendererInner {
     }
 
     fn finish_success(&self, key: RenderKey, png: LatexPng) {
-        let png_bytes = png.bytes.len();
         let Some(terminal_bytes) = RenderedImage::terminal_bytes(&png) else {
             self.finish_failure(key);
             return;
         };
-        if png_bytes > self.limits.cache_byte_capacity
-            || terminal_bytes > self.limits.cache_terminal_byte_capacity
-        {
-            self.finish_failure(key);
-            return;
-        }
         let updated = {
             let mut state = self.state();
-            if state.generation != key.generation {
-                return;
-            }
-            if state.rendering_disabled {
-                state.cache.discard_pending(&key);
+            if state.generation != key.generation || state.rendering_disabled {
                 return;
             }
             match state.cache.complete(&key, png, terminal_bytes) {
@@ -305,7 +270,7 @@ impl RendererInner {
     fn finish_failure(&self, key: RenderKey) {
         let updated = {
             let mut state = self.state();
-            if state.generation != key.generation || state.rendering_disabled {
+            if state.generation != key.generation {
                 return;
             }
             state.cache.fail(&key)

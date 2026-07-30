@@ -1170,12 +1170,11 @@ mod tests {
         let deletion = output
             .find("\x1b_Ga=d,d=I,i=42,q=2;")
             .expect("image deletion");
-        let clear = output.find("\x1b[2J\x1b[3J").expect("terminal clear");
 
         assert_eq!(definitions.len(), 2);
         assert!(definitions[0] < deletion);
-        assert!(deletion < clear);
-        assert!(clear < definitions[1]);
+        assert!(deletion < definitions[1]);
+        assert!(!output.contains("\x1b[2J\x1b[3J"));
     }
 
     #[test]

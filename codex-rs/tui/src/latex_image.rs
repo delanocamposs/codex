@@ -67,9 +67,9 @@ const MACRO_MUTATION_CONTROLS: [&str; 11] = [
 ];
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct ValidatedLatexFormula(Arc<str>);
+pub(crate) struct AdmissibleLatexFormula(Arc<str>);
 
-impl ValidatedLatexFormula {
+impl AdmissibleLatexFormula {
     pub(crate) fn new(formula: &str) -> Result<Self, LatexImageError> {
         let formula = formula.trim();
         if formula.is_empty() {
@@ -147,7 +147,7 @@ pub(crate) enum LatexImageError {
 
 #[cfg(unix)]
 pub(crate) fn render_formula(
-    formula: &ValidatedLatexFormula,
+    formula: &AdmissibleLatexFormula,
     style: LatexRenderStyle,
     cell_height: u32,
     foreground: [u8; 3],
@@ -207,7 +207,7 @@ fn apply_inline_strut(display_list: &mut DisplayList) {
 
 #[cfg(not(unix))]
 pub(crate) fn render_formula(
-    _formula: &ValidatedLatexFormula,
+    _formula: &AdmissibleLatexFormula,
     _style: LatexRenderStyle,
     _cell_height: u32,
     _foreground: [u8; 3],
@@ -308,9 +308,7 @@ fn validate_png(bytes: Vec<u8>) -> Result<LatexPng, LatexImageError> {
     let (width, height) = ImageReader::with_format(Cursor::new(&bytes), ImageFormat::Png)
         .into_dimensions()
         .map_err(|error| LatexImageError::InvalidPng(error.to_string()))?;
-    if width == 0
-        || height == 0
-        || width > MAX_IMAGE_DIMENSION
+    if width > MAX_IMAGE_DIMENSION
         || height > MAX_IMAGE_DIMENSION
         || u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS
     {

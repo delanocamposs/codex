@@ -23,12 +23,9 @@ fn finalized_markdown_reuses_lines_primed_by_transcript_height() {
     let width = 48;
 
     assert_eq!(cell.desired_transcript_height(width), 1);
-    replace_cached_lines(&cell.transcript_rendered_lines, |_| {});
+    replace_cached_lines(&cell.rendered_lines, |_| {});
 
-    assert_eq!(
-        visible_lines(cell.transcript_hyperlink_lines(width)),
-        vec![Line::from("cached")]
-    );
+    assert_eq!(cell.display_lines(width), vec![Line::from("cached")]);
 }
 
 #[test]
@@ -80,29 +77,4 @@ fn visualization_directives_are_not_cached() {
     cell.display_lines(/*width*/ 48);
 
     assert!(cell.rendered_lines.is_none());
-    assert!(cell.transcript_rendered_lines.is_none());
-}
-
-#[tokio::test]
-async fn display_math_pngs_are_not_retained_in_the_markdown_cache() {
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
-    let renderer = crate::latex_renderer::LatexRenderer::new_for_tests(event_tx);
-    let cell = AgentMarkdownCell::new("$$\nx^2\n$$".to_string(), Path::new("/tmp"))
-        .with_latex_renderer(renderer.handle());
-
-    cell.display_lines(/*width*/ 48);
-    tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
-        .await
-        .expect("display-math render timed out")
-        .expect("display-math event channel closed");
-    cell.display_lines(/*width*/ 48);
-
-    assert_eq!(
-        (
-            cell.rendered_lines.is_none(),
-            cell.transcript_rendered_lines.is_some(),
-            cell.has_stable_transcript_height(),
-        ),
-        (true, true, true),
-    );
 }

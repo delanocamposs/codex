@@ -25,6 +25,15 @@ fn test_png() -> LatexPng {
     }
 }
 
+fn rendered_image() -> RenderedImage {
+    let png = test_png();
+    RenderedImage {
+        terminal_bytes: RenderedImage::terminal_bytes(&png).expect("bounded fixture"),
+        png,
+        image_id: 1,
+    }
+}
+
 #[test]
 fn terminal_window_size_converts_to_cell_pixels_with_conservative_fallbacks() {
     let sizes = [
@@ -59,7 +68,7 @@ fn image_layout_preserves_shape_within_bounds() {
 
 #[test]
 fn inline_layout_is_one_row_and_preserves_aspect_ratio_within_its_cap() {
-    let rendered = RenderedImage::new(test_png()).expect("available image ID");
+    let rendered = rendered_image();
     let cases = [
         (rendered.png.width, rendered.png.height, 12, (8, 16)),
         (rendered.png.width, rendered.png.height, 3, (8, 16)),
@@ -88,7 +97,7 @@ fn inline_layout_is_one_row_and_preserves_aspect_ratio_within_its_cap() {
 #[test]
 #[allow(clippy::disallowed_methods)]
 fn placeholder_grid_has_exact_coordinates_and_metadata() {
-    let rendered = RenderedImage::new(test_png()).expect("available image ID");
+    let rendered = rendered_image();
 
     let lines = placeholder_lines(&rendered, /*columns*/ 2, /*rows*/ 2);
     let image_id = rendered.image_id;
@@ -145,7 +154,7 @@ fn placeholder_grid_has_exact_coordinates_and_metadata() {
 
 #[test]
 fn image_id_is_stable_and_placement_id_tracks_placeholder_geometry() {
-    let rendered = RenderedImage::new(test_png()).expect("available image ID");
+    let rendered = rendered_image();
 
     let first = placeholder_lines(&rendered, /*columns*/ 5, /*rows*/ 3);
     let repeated = placeholder_lines(&rendered, /*columns*/ 5, /*rows*/ 3);

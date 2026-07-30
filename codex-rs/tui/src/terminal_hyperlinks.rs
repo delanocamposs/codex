@@ -260,14 +260,19 @@ fn wrap_hyperlink_line(
 }
 
 fn kitty_images_remain_intact(source: &HyperlinkLine, wrapped: &[HyperlinkLine]) -> bool {
-    source
-        .kitty_images
+    let metadata = |annotation: &KittyImageAnnotation| {
+        (
+            annotation.image.image_id(),
+            annotation.image.placement_id(),
+            annotation.image.columns(),
+            annotation.image.rows(),
+            annotation.columns.len(),
+        )
+    };
+    source.kitty_images.iter().map(metadata).eq(wrapped
         .iter()
-        .map(|annotation| (&annotation.image, annotation.columns.len()))
-        .eq(wrapped
-            .iter()
-            .flat_map(|line| &line.kitty_images)
-            .map(|annotation| (&annotation.image, annotation.columns.len())))
+        .flat_map(|line| &line.kitty_images)
+        .map(metadata))
 }
 
 pub(crate) fn adaptive_wrap_hyperlink_lines(

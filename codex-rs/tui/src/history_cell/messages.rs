@@ -363,10 +363,9 @@ impl HistoryCell for AgentMessageCell {
 /// session that produced the message. Reusing the current process cwd during reflow would make old
 /// transcript content change meaning after a later `/cd` or resumed session.
 ///
-/// Ordinary markdown separately caches its latest display and transcript renders. Visualization
-/// directives bypass both caches because their external state can change after the cell is
-/// constructed. Rendered LaTeX bypasses only the display cache because transcript rendering omits
-/// terminal images.
+/// Ordinary markdown caches its latest render. Visualization directives bypass the cache because
+/// their external state can change after the cell is constructed. Rendered LaTeX bypasses the cache
+/// for display only; the literal transcript still shares the ordinary cache.
 #[derive(Debug)]
 pub(crate) struct AgentMarkdownCell {
     markdown_source: String,
@@ -374,7 +373,6 @@ pub(crate) struct AgentMarkdownCell {
     inline_visualization_context: Option<crate::inline_visualization::InlineVisualizationContext>,
     latex_renderer: Option<crate::latex_renderer::LatexRenderHandle>,
     rendered_lines: Option<MarkdownRenderCache>,
-    transcript_rendered_lines: Option<MarkdownRenderCache>,
 }
 
 impl AgentMarkdownCell {
@@ -406,7 +404,6 @@ impl AgentMarkdownCell {
             inline_visualization_context,
             latex_renderer: None,
             rendered_lines: cacheable.then(MarkdownRenderCache::default),
-            transcript_rendered_lines: cacheable.then(MarkdownRenderCache::default),
         }
     }
 
@@ -415,7 +412,6 @@ impl AgentMarkdownCell {
         renderer: crate::latex_renderer::LatexRenderHandle,
     ) -> Self {
         self.latex_renderer = Some(renderer);
-        self.rendered_lines = None;
         self
     }
 
@@ -474,11 +470,13 @@ impl HistoryCell for AgentMarkdownCell {
     fn display_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
         let render = || self.render_markdown(width, self.latex_renderer.as_ref());
 
-        if let Some(rendered_lines) = &self.rendered_lines {
-            rendered_lines.render(width, render)
-        } else {
+        if self.latex_renderer.is_some() {
             // Display-math lines can own PNG Arcs. Keep those exclusively in the bounded renderer
             // cache instead of retaining an additional copy for every historical message.
+            render()
+        } else if let Some(rendered_lines) = &self.rendered_lines {
+            rendered_lines.render(width, render)
+        } else {
             render()
         }
     }
@@ -487,7 +485,7 @@ impl HistoryCell for AgentMarkdownCell {
         // Kitty placeholders are deliberately omitted from Ctrl+T so selection remains copyable
         // and the pager never depends on scrollback-only image transmission hooks.
         let render = || self.render_markdown(width, /*latex_renderer*/ None);
-        if let Some(rendered_lines) = &self.transcript_rendered_lines {
+        if let Some(rendered_lines) = &self.rendered_lines {
             rendered_lines.render(width, render)
         } else {
             render()
@@ -499,7 +497,7 @@ impl HistoryCell for AgentMarkdownCell {
     }
 
     fn has_stable_transcript_height(&self) -> bool {
-        self.transcript_rendered_lines.is_some()
+        self.rendered_lines.is_some()
     }
 }
 

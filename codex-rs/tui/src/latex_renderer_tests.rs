@@ -93,6 +93,51 @@ fn normalized_placeholder_text(line: &HyperlinkLine) -> String {
         .collect()
 }
 
+fn image_snapshot(lines: &[HyperlinkLine]) -> String {
+    lines
+        .iter()
+        .map(|line| {
+            let text = normalized_placeholder_text(line).trim_end().to_string();
+            if line.kitty_images.is_empty() {
+                text
+            } else {
+                format!("{text} [Kitty image]")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+async fn render_without_math_request(source: &str) -> String {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let render_calls = Arc::clone(&calls);
+    let render: Arc<RenderFn> = Arc::new(move |_, _, _, _| {
+        render_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(test_png(/*byte_len*/ 3))
+    });
+    let (renderer, mut event_rx) =
+        start_test_renderer(render, test_limits(/*cache_entry_capacity*/ 2));
+    let cell = AgentMarkdownCell::new(source.to_string(), std::path::Path::new("/tmp"))
+        .with_latex_renderer(renderer.handle());
+
+    let pending = cell.display_hyperlink_lines(/*width*/ 80);
+    assert!(
+        pending.iter().all(|line| line.kitty_images.is_empty()),
+        "opaque math must stay literal",
+    );
+    assert!(
+        timeout(Duration::from_millis(100), event_rx.recv())
+            .await
+            .is_err(),
+        "opaque math scheduled a LaTeX render",
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let ready = cell.display_hyperlink_lines(/*width*/ 80);
+    assert!(ready.iter().all(|line| line.kitty_images.is_empty()));
+    image_snapshot(&ready)
+}
+
 #[derive(Default)]
 struct BlockingRender {
     calls: AtomicUsize,
@@ -210,32 +255,39 @@ async fn live_capacity_is_stable_and_a_new_live_message_can_replace_it() {
 }
 
 #[tokio::test]
-async fn historical_aggregate_byte_rejections_do_not_alternate_forever() {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let render_calls = Arc::clone(&calls);
-    let render: Arc<RenderFn> = Arc::new(move |_, _, _, _| {
-        render_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(test_png(/*byte_len*/ 3))
-    });
-    let mut limits = test_limits(/*cache_entry_capacity*/ 3);
-    limits.cache_byte_capacity = 4;
-    let (renderer, mut event_rx) = start_test_renderer(render, limits);
-    let historical = renderer.handle().for_render_pass_with_cell_pixels((8, 16));
+async fn historical_aggregate_storage_rejections_do_not_alternate_forever() {
+    for (cache_byte_capacity, cache_terminal_byte_capacity) in [
+        (4, usize::MAX),
+        // A test image decodes to 80 × 32 × 4 = 10,240 terminal bytes.
+        (usize::MAX, 15_000),
+    ] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let render_calls = Arc::clone(&calls);
+        let render: Arc<RenderFn> = Arc::new(move |_, _, _, _| {
+            render_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(test_png(/*byte_len*/ 3))
+        });
+        let mut limits = test_limits(/*cache_entry_capacity*/ 3);
+        limits.cache_byte_capacity = cache_byte_capacity;
+        limits.cache_terminal_byte_capacity = cache_terminal_byte_capacity;
+        let (renderer, mut event_rx) = start_test_renderer(render, limits);
+        let historical = renderer.handle().for_render_pass_with_cell_pixels((8, 16));
 
-    assert_eq!(historical.render("a", /*max_columns*/ 40), None);
-    assert_eq!(next_render_generation(&mut event_rx).await, 1);
-    assert!(historical.render("a", /*max_columns*/ 40).is_some());
-
-    for formula in ["b", "c"] {
-        assert_eq!(historical.render(formula, /*max_columns*/ 40), None);
+        assert_eq!(historical.render("a", /*max_columns*/ 40), None);
         assert_eq!(next_render_generation(&mut event_rx).await, 1);
-        assert_eq!(historical.render(formula, /*max_columns*/ 40), None);
+        assert!(historical.render("a", /*max_columns*/ 40).is_some());
+
+        for formula in ["b", "c"] {
+            assert_eq!(historical.render(formula, /*max_columns*/ 40), None);
+            assert_eq!(next_render_generation(&mut event_rx).await, 1);
+            assert_eq!(historical.render(formula, /*max_columns*/ 40), None);
+        }
+        for formula in ["b", "c", "b", "c"] {
+            assert_eq!(historical.render(formula, /*max_columns*/ 40), None);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(event_rx.try_recv().is_err());
     }
-    for formula in ["b", "c", "b", "c"] {
-        assert_eq!(historical.render(formula, /*max_columns*/ 40), None);
-    }
-    assert_eq!(calls.load(Ordering::SeqCst), 3);
-    assert!(event_rx.try_recv().is_err());
 }
 
 #[tokio::test]
@@ -444,18 +496,7 @@ async fn completed_display_math_has_a_visual_snapshot_and_literal_transcript() {
     assert!(ready.iter().any(|line| !line.kitty_images.is_empty()));
     assert_eq!(cell.transcript_hyperlink_lines(/*width*/ 48), pending);
 
-    let snapshot = ready
-        .iter()
-        .map(|line| {
-            let text = normalized_placeholder_text(line);
-            if line.kitty_images.is_empty() {
-                text
-            } else {
-                format!("{text} [Kitty image]")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let snapshot = image_snapshot(&ready);
     assert_snapshot!("display_math_agent_cell_ready", snapshot);
 }
 
@@ -508,26 +549,34 @@ async fn display_math_inside_numbered_items_keeps_labels_and_continuation_indent
     image_ids.dedup();
     assert_eq!(image_ids.len(), 4);
 
-    let snapshot_lines = |lines: &[HyperlinkLine]| {
-        lines
-            .iter()
-            .map(|line| {
-                let text = normalized_placeholder_text(line);
-                if line.kitty_images.is_empty() {
-                    text
-                } else {
-                    format!("{text} [Kitty image]")
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
     let snapshot = format!(
         "[literal fallback]\n{}\n\n[ready]\n{}",
-        snapshot_lines(&pending),
-        snapshot_lines(&ready),
+        image_snapshot(&pending),
+        image_snapshot(&ready),
     );
     assert_snapshot!("display_math_numbered_list_ready", snapshot);
+}
+
+#[tokio::test]
+async fn display_math_inside_blockquote_keeps_quote_layout() {
+    let source = "> Before\n>\n> \\[\n> x^2\n> \\]\n>\n> After";
+    let (renderer, mut event_rx) =
+        start_test_renderer(immediate_render(), test_limits(/*cache_entry_capacity*/ 2));
+    let cell = AgentMarkdownCell::new(source.to_string(), std::path::Path::new("/tmp"))
+        .with_latex_renderer(renderer.handle());
+
+    let pending = cell.display_hyperlink_lines(/*width*/ 48);
+    assert_eq!(next_render_generation(&mut event_rx).await, 1);
+    let ready = cell.display_hyperlink_lines(/*width*/ 48);
+    assert!(ready.iter().any(|line| !line.kitty_images.is_empty()));
+    assert_eq!(cell.transcript_hyperlink_lines(/*width*/ 48), pending);
+
+    let snapshot = format!(
+        "[literal fallback]\n{}\n\n[ready]\n{}",
+        image_snapshot(&pending),
+        image_snapshot(&ready),
+    );
+    assert_snapshot!("display_math_blockquote_ready", snapshot);
 }
 
 #[tokio::test]
@@ -558,7 +607,47 @@ async fn completed_inline_math_has_a_one_row_visual_snapshot_and_literal_transcr
 }
 
 #[tokio::test]
-async fn inline_math_table_snapshot_excludes_code_and_link_labels() {
+async fn unlabelled_fenced_code_in_a_list_does_not_schedule_inline_math() {
+    let source = concat!("- item\n\n", "    ```\n", "  \\(code\\)\n", "    ```",);
+
+    let rendered = render_without_math_request(source).await;
+
+    assert!(rendered.lines().any(|line| line.trim() == r"\(code\)"));
+    assert!(!rendered.contains("```"));
+}
+
+#[tokio::test]
+async fn tab_padded_list_indented_code_does_not_schedule_inline_math() {
+    let rendered = render_without_math_request("-\t  \\(code\\)").await;
+
+    assert!(rendered.contains(r"\(code\)"));
+}
+
+#[tokio::test]
+async fn html_code_element_does_not_schedule_inline_math() {
+    for source in [
+        r"<code>\(code\)</code>",
+        "<code\n class=x>\\(code\\)</code>",
+    ] {
+        let rendered = render_without_math_request(source).await;
+        assert!(rendered.contains("(code)"), "{rendered:?}");
+    }
+}
+
+#[tokio::test]
+async fn math_syntax_in_opaque_markdown_regions_does_not_schedule_a_render() {
+    for source in [
+        r"[docs](https://example.test/\(version\))",
+        "<div>\n\\(literal\\)\n</div>\n\n**after**",
+        r"<\(x\):y>",
+        "[\\(x\\)]\n\n[aaaaa]: https://example.com",
+    ] {
+        render_without_math_request(source).await;
+    }
+}
+
+#[tokio::test]
+async fn inline_math_table_snapshot_excludes_code_and_renders_link_labels() {
     let source = concat!(
         "| Kind | Value |\n",
         "| --- | --- |\n",
@@ -578,8 +667,15 @@ async fn inline_math_table_snapshot_excludes_code_and_link_labels() {
     );
     assert_eq!(next_render_generation(&mut event_rx).await, 1);
     assert_eq!(next_render_generation(&mut event_rx).await, 1);
+    assert_eq!(next_render_generation(&mut event_rx).await, 1);
     let ready = cell.display_hyperlink_lines(/*width*/ 100);
-    assert_eq!(ready.iter().flat_map(|line| &line.kitty_images).count(), 2,);
+    assert_eq!(ready.iter().flat_map(|line| &line.kitty_images).count(), 3);
+    assert!(
+        ready
+            .iter()
+            .flat_map(|line| &line.hyperlinks)
+            .any(|link| link.destination == "https://example.com")
+    );
 
     let snapshot = ready
         .iter()

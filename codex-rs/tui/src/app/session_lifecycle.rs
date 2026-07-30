@@ -19,12 +19,6 @@ pub(super) enum ThreadAttachPresentation {
     PromptEdit,
 }
 
-#[derive(Clone, Copy)]
-pub(super) enum ThreadUiReset {
-    Required,
-    AlreadyCleared,
-}
-
 /// Reports whether a loaded-thread backfill completed and which descendants already had their
 /// liveness metadata refreshed, allowing the picker to skip duplicate `thread/read` requests.
 #[derive(Default)]
@@ -567,8 +561,8 @@ impl App {
     }
 
     pub(super) fn reset_for_thread_switch(&mut self, tui: &mut tui::Tui) -> Result<()> {
-        tui.clear_pending_history_lines();
         self.reset_transcript_state_after_clear();
+        tui.clear_pending_history_lines();
         Self::clear_terminal_for_thread_switch(&mut tui.terminal)?;
         Ok(())
     }
@@ -705,11 +699,6 @@ impl App {
                         tui,
                         started,
                         ThreadAttachPresentation::SessionLineage,
-                        if session_start_source == Some(ThreadStartSource::Clear) {
-                            ThreadUiReset::AlreadyCleared
-                        } else {
-                            ThreadUiReset::Required
-                        },
                         initial_user_message,
                     )
                     .await
@@ -750,15 +739,11 @@ impl App {
         tui: &mut tui::Tui,
         started: AppServerStartedThread,
         presentation: ThreadAttachPresentation,
-        ui_reset: ThreadUiReset,
         initial_user_message: Option<crate::chatwidget::UserMessage>,
     ) -> Result<()> {
         // Initial messages are for freshly attached primary threads only. Thread switches and
         // resume/fork flows pass `None` so they cannot replay old history and then auto-submit a new
         // user turn by accident.
-        if matches!(ui_reset, ThreadUiReset::Required) {
-            self.reset_for_thread_switch(tui)?;
-        }
         self.reset_thread_event_state();
         let init = self.chatwidget_init_for_forked_or_resumed_thread(
             tui,
@@ -1042,7 +1027,6 @@ impl App {
                         tui,
                         resumed,
                         ThreadAttachPresentation::SessionLineage,
-                        ThreadUiReset::Required,
                         /*initial_user_message*/ None,
                     )
                     .await

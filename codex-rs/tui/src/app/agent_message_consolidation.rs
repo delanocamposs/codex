@@ -55,10 +55,8 @@ impl App {
                 "ConsolidateAgentMessage: replacing cells [{start}..{end}] with AgentMarkdownCell"
             );
             let mut math_image_ready = false;
-            let latex_renderer = self
-                .latex_renderer
-                .as_ref()
-                .filter(|_| crate::markdown::agent_markdown_contains_math(&source));
+            let has_math = crate::math_source::PreparedMath::new(&source).has_math();
+            let latex_renderer = self.latex_renderer.as_ref().filter(|_| has_math);
             let mut consolidated = history_cell::AgentMarkdownCell::new_with_inline_visualizations(
                 source,
                 &cwd,

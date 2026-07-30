@@ -14,8 +14,8 @@ use super::kitty_placeholder::inline_placeholder_line;
 use super::kitty_placeholder::latex_foreground;
 use super::kitty_placeholder::placeholder_lines;
 use super::kitty_placeholder::terminal_cell_pixels;
+use crate::latex_image::AdmissibleLatexFormula;
 use crate::latex_image::LatexRenderStyle;
-use crate::latex_image::ValidatedLatexFormula;
 use crate::terminal_hyperlinks::HyperlinkLine;
 
 /// A generation-scoped, non-blocking view of the LaTeX render cache.
@@ -67,8 +67,7 @@ impl LatexRenderHandle {
 
     pub(crate) fn render(&self, formula: &str, max_columns: u16) -> Option<Vec<HyperlinkLine>> {
         let cell_pixels = self.cell_pixels.unwrap_or_else(terminal_cell_pixels);
-        let image =
-            self.ready_image(formula, max_columns, LatexRenderStyle::Display, cell_pixels)?;
+        let image = self.ready_image(formula, LatexRenderStyle::Display, cell_pixels)?;
         let (columns, rows) =
             image_cell_layout(image.png.width, image.png.height, max_columns, cell_pixels);
         Some(placeholder_lines(&image, columns, rows))
@@ -76,8 +75,7 @@ impl LatexRenderHandle {
 
     pub(crate) fn render_inline(&self, formula: &str, max_columns: u16) -> Option<HyperlinkLine> {
         let cell_pixels = self.cell_pixels.unwrap_or_else(terminal_cell_pixels);
-        let image =
-            self.ready_image(formula, max_columns, LatexRenderStyle::Inline, cell_pixels)?;
+        let image = self.ready_image(formula, LatexRenderStyle::Inline, cell_pixels)?;
         let columns =
             inline_image_cell_layout(image.png.width, image.png.height, max_columns, cell_pixels);
         Some(inline_placeholder_line(&image, columns))
@@ -86,14 +84,10 @@ impl LatexRenderHandle {
     fn ready_image(
         &self,
         formula: &str,
-        max_columns: u16,
         style: LatexRenderStyle,
         cell_pixels: (u32, u32),
     ) -> Option<Arc<RenderedImage>> {
-        if max_columns == 0 {
-            return None;
-        }
-        let formula = ValidatedLatexFormula::new(formula).ok()?;
+        let formula = AdmissibleLatexFormula::new(formula).ok()?;
         let foreground = latex_foreground();
         let key = RenderKey {
             generation: self.generation,

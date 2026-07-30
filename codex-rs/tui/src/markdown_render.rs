@@ -83,8 +83,9 @@ use inline_math::InlineMathCursor;
 
 pub(crate) use math::MarkdownRenderOptions;
 pub(crate) use math::render_markdown_lines;
+pub(crate) use math::render_prepared_markdown_lines;
 pub(crate) use streaming::StreamingMarkdownRender;
-pub(crate) use streaming::render_streaming_markdown_lines_with_width_and_cwd;
+pub(crate) use streaming::render_prepared_streaming_markdown_lines_with_width_and_cwd;
 
 const TABLE_COLUMN_GAP: usize = 2;
 const TABLE_CELL_PADDING: usize = 1;
@@ -2481,7 +2482,7 @@ mod tests {
             /*wrap_width*/ Some(80),
             /*cwd*/ None,
             &never_hide_link_destination,
-            InlineMathCursor::new("", /*mask*/ None, Vec::new()),
+            InlineMathCursor::new("", Vec::new()),
         );
         let wrapped = writer.wrap_cell(&cell, /*width*/ 40);
         let rendered = wrapped

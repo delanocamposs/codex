@@ -316,7 +316,7 @@ fn write_history_line<W: Write>(
         .spans
         .iter()
         .map(|s| Span {
-            style: s.style.patch(line.line.style),
+            style: line.line.style.patch(s.style),
             content: s.content.clone(),
         })
         .collect();
@@ -531,24 +531,41 @@ mod tests {
 
     #[test]
     #[allow(clippy::disallowed_methods)]
-    fn writes_and_resets_underline_color_metadata_for_kitty_placement_ids() {
-        let spans = [Span::from("X").style(Style::new().underline_color(Color::Rgb(1, 2, 3)))];
+    fn span_metadata_overrides_line_color_for_kitty_placeholders() {
+        let line = HyperlinkLine::new(Line::from(
+            Span::from("X").style(
+                Style::new()
+                    .fg(Color::Rgb(1, 2, 3))
+                    .underline_color(Color::Rgb(4, 5, 6)),
+            ),
+        ))
+        .style(Style::new().fg(Color::Green));
         let mut actual = Vec::new();
-        let mut expected = Vec::new();
 
-        write_spans(&mut actual, spans.iter()).expect("write styled span");
+        write_history_line(&mut actual, &line, /*wrap_width*/ 80).expect("write placeholder");
+        let mut foreground = Vec::new();
         queue!(
-            expected,
-            SetUnderlineColor(CColor::Rgb { r: 1, g: 2, b: 3 }),
-            Print("X"),
-            SetUnderlineColor(CColor::Reset),
-            SetForegroundColor(CColor::Reset),
-            SetBackgroundColor(CColor::Reset),
-            SetAttribute(crossterm::style::Attribute::Reset),
+            foreground,
+            SetForegroundColor(CColor::Rgb { r: 1, g: 2, b: 3 })
         )
-        .expect("queue expected metadata");
+        .expect("queue foreground");
+        let mut underline = Vec::new();
+        queue!(
+            underline,
+            SetUnderlineColor(CColor::Rgb { r: 4, g: 5, b: 6 })
+        )
+        .expect("queue underline");
 
-        assert_eq!(actual, expected);
+        assert!(
+            actual
+                .windows(foreground.len())
+                .any(|window| window == foreground.as_slice())
+        );
+        assert!(
+            actual
+                .windows(underline.len())
+                .any(|window| window == underline.as_slice())
+        );
     }
 
     #[test]

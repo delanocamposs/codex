@@ -137,7 +137,6 @@ impl App {
                 tui,
                 started,
                 ThreadAttachPresentation::SessionLineage,
-                super::session_lifecycle::ThreadUiReset::Required,
                 /*initial_user_message*/ None,
             )
             .await

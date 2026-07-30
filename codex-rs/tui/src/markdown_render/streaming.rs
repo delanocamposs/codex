@@ -31,27 +31,30 @@ pub(crate) struct StreamingMarkdownRender {
 ///
 /// Every reported byte offset indexes the exact `input` passed here. Callers that transform source
 /// before rendering must map the offset back to their original source before retaining a prefix.
-pub(crate) fn render_streaming_markdown_lines_with_width_and_cwd(
-    input: &str,
+pub(crate) fn render_prepared_streaming_markdown_lines_with_width_and_cwd(
+    prepared_math: crate::math_source::PreparedMath<'_>,
     width: Option<usize>,
     cwd: Option<&Path>,
 ) -> StreamingMarkdownRender {
+    if prepared_math.renders_literal() {
+        return StreamingMarkdownRender {
+            lines: super::math::render_literal_lines(prepared_math.source(), width),
+            last_top_level_block_start: None,
+            has_reference_link_definition: true,
+            first_top_level_block_is_html: false,
+        };
+    }
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TABLES);
-    let render_literal = || StreamingMarkdownRender {
-        lines: super::math::render_literal_lines(input, width),
-        last_top_level_block_start: None,
-        has_reference_link_definition: false,
-        first_top_level_block_is_html: false,
-    };
-    let prepared_inline_math = crate::inline_math::PreparedInlineMath::new(input);
-    if prepared_inline_math.renders_literal() {
-        return render_literal();
-    }
-    let pending_display_math_start = prepared_inline_math.pending_display_math_start();
-    let (markdown, inline_math_mask, inline_math_spans, display_math) =
-        prepared_inline_math.into_parts();
+    let pending_display_math_start = prepared_math.pending_display_start();
+    let crate::math_source::PreparedMathParts {
+        source,
+        markdown,
+        inline,
+        display,
+    } = prepared_math.into_parts();
+    let input = source.as_ref();
     let parser = Parser::new_ext(&markdown, options);
     let has_reference_link_definition = parser.reference_definitions().iter().next().is_some();
     let parser = TopLevelBlockTracker {
@@ -67,11 +70,9 @@ pub(crate) fn render_streaming_markdown_lines_with_width_and_cwd(
         width,
         cwd,
         &never_hide_link_destination,
-        InlineMathCursor::new(input, inline_math_mask, inline_math_spans),
+        InlineMathCursor::new(input, inline),
     );
-    if !writer.run(display_math) {
-        return render_literal();
-    }
+    writer.run(display);
     let mut last_top_level_block_start =
         (writer.iter.block_count > 1).then_some(writer.iter.last_start);
     if let Some(pending_math_start) = pending_display_math_start {

@@ -5,7 +5,6 @@
 
 use super::resize_reflow::trailing_run_start;
 use super::session_lifecycle::ThreadAttachPresentation;
-use super::session_lifecycle::ThreadUiReset;
 use super::*;
 use crate::app_server_session::ForkGoalContinuation;
 use crate::config_update::format_config_error;
@@ -208,7 +207,6 @@ impl App {
                                     tui,
                                     forked,
                                     ThreadAttachPresentation::SessionLineage,
-                                    ThreadUiReset::Required,
                                     /*initial_user_message*/ None,
                                 )
                                 .await
@@ -310,7 +308,6 @@ impl App {
                                 tui,
                                 forked,
                                 ThreadAttachPresentation::PromptEdit,
-                                ThreadUiReset::Required,
                                 /*initial_user_message*/ None,
                             )
                             .await

@@ -1,35 +1,35 @@
 //! Ordered substitution of masked inline-math spans during Markdown rendering.
 
-use std::collections::VecDeque;
 use std::ops::Range;
 
-use crate::inline_math::InlineMathSpan;
+use crate::math_source::InlineMathSpan;
 
-pub(super) enum InlineMathText<'a> {
-    Plain(&'a str),
-    Segmented(Vec<InlineMathSegment<'a>>),
-    SourceLiteral(String),
+pub(super) enum InlineMathText<'text, 'source> {
+    Plain(&'text str),
+    Segmented(Vec<InlineMathSegment<'text, 'source>>),
+    SourceLiteral(&'source str),
 }
 
-pub(super) enum InlineMathSegment<'a> {
-    Text(&'a str),
-    Math(InlineMathSpan),
+pub(super) enum InlineMathSegment<'text, 'source> {
+    Text(&'text str),
+    Math {
+        raw: &'source str,
+        formula: &'source str,
+    },
 }
 
 pub(super) struct InlineMathCursor<'a> {
     source: &'a str,
-    mask: Option<char>,
-    spans: VecDeque<InlineMathSpan>,
-    failed: bool,
+    spans: Vec<InlineMathSpan>,
+    next: usize,
 }
 
 impl<'a> InlineMathCursor<'a> {
-    pub(super) fn new(source: &'a str, mask: Option<char>, spans: Vec<InlineMathSpan>) -> Self {
+    pub(super) fn new(source: &'a str, spans: Vec<InlineMathSpan>) -> Self {
         Self {
             source,
-            mask,
-            spans: spans.into(),
-            failed: false,
+            spans,
+            next: 0,
         }
     }
 
@@ -37,16 +37,17 @@ impl<'a> InlineMathCursor<'a> {
         &mut self,
         text: &'text str,
         source_range: Range<usize>,
-    ) -> InlineMathText<'text> {
-        let Some(mask) = self.mask.filter(|mask| text.contains(*mask)) else {
+    ) -> InlineMathText<'text, 'a> {
+        self.skip_spans_before(source_range.start);
+        if self
+            .spans
+            .get(self.next)
+            .is_none_or(|span| span.source_range.start >= source_range.end)
+        {
             return InlineMathText::Plain(text);
-        };
-        if self.failed {
-            return InlineMathText::SourceLiteral(self.source_literal(source_range));
         }
-
-        let Some(plan) = self.plan(text, source_range.clone(), mask) else {
-            self.failed = true;
+        let Some(plan) = self.plan(text, &source_range) else {
+            self.skip_spans_through(source_range.end);
             return InlineMathText::SourceLiteral(self.source_literal(source_range));
         };
 
@@ -56,16 +57,14 @@ impl<'a> InlineMathCursor<'a> {
             if text_start < run.start {
                 segments.push(InlineMathSegment::Text(&text[text_start..run.start]));
             }
-            let mut substitution_start = run.start;
-            for _ in 0..run.substitution_count {
-                let Some(span) = self.spans.pop_front() else {
-                    unreachable!("inline-math substitutions were validated before substitution");
-                };
-                let substitution_end = substitution_start + span.source_range.len();
-                segments.push(InlineMathSegment::Math(span));
-                substitution_start = substitution_end;
-            }
-            debug_assert_eq!(substitution_start, run.end);
+            let span = &self.spans[self.next];
+            self.next += 1;
+            debug_assert_eq!(run.start + span.source_range.len(), run.end);
+            let raw = &self.source[span.source_range.clone()];
+            segments.push(InlineMathSegment::Math {
+                raw,
+                formula: &raw[2..raw.len() - 2],
+            });
             text_start = run.end;
         }
         if text_start < text.len() {
@@ -75,75 +74,83 @@ impl<'a> InlineMathCursor<'a> {
     }
 
     pub(super) fn discard(&mut self, text: &str, source_range: Range<usize>) {
-        let Some(mask) = self.mask.filter(|mask| text.contains(*mask)) else {
-            return;
-        };
-        if self.failed {
+        self.skip_spans_before(source_range.start);
+        if self
+            .spans
+            .get(self.next)
+            .is_none_or(|span| span.source_range.start >= source_range.end)
+        {
             return;
         }
-        let Some(plan) = self.plan(text, source_range, mask) else {
-            self.failed = true;
+        let Some(plan) = self.plan(text, &source_range) else {
+            self.skip_spans_through(source_range.end);
             return;
         };
-        let substitution_count = plan.iter().map(|run| run.substitution_count).sum::<usize>();
-        self.spans.drain(..substitution_count);
+        self.next += plan.len();
     }
 
     pub(super) fn is_complete(&self) -> bool {
-        self.failed || self.spans.is_empty()
+        self.next == self.spans.len()
     }
 
-    fn plan(&self, text: &str, source_range: Range<usize>, mask: char) -> Option<Vec<MaskRun>> {
+    fn skip_spans_before(&mut self, offset: usize) {
+        let mut skipped = false;
+        while self
+            .spans
+            .get(self.next)
+            .is_some_and(|span| span.source_range.end <= offset)
+        {
+            self.next += 1;
+            skipped = true;
+        }
+        debug_assert!(
+            !skipped,
+            "every parser-accepted inline formula must reach a text event"
+        );
+    }
+
+    fn skip_spans_through(&mut self, offset: usize) {
+        while self
+            .spans
+            .get(self.next)
+            .is_some_and(|span| span.source_range.start < offset)
+        {
+            self.next += 1;
+        }
+    }
+
+    fn plan(&self, text: &str, source_range: &Range<usize>) -> Option<Vec<MaskRun>> {
         let mut plan = Vec::new();
-        let mut pending = self.spans.iter();
+        let mut pending = self.spans[self.next..].iter();
         let mut remainder = text;
         let mut offset = 0usize;
 
-        while let Some(relative_start) = remainder.find(mask) {
-            let start = offset + relative_start;
-            let run_len = remainder[relative_start..]
-                .chars()
-                .take_while(|character| *character == mask)
-                .map(char::len_utf8)
-                .sum::<usize>();
-            let mut matched_len = 0usize;
-            let mut substitution_count = 0usize;
-            while matched_len < run_len {
-                let span = pending.next()?;
-                if !source_range_contains(&source_range, &span.source_range)
-                    || self.source.get(span.source_range.clone()) != Some(span.raw.as_str())
-                {
-                    return None;
-                }
-                matched_len = matched_len.checked_add(span.source_range.len())?;
-                substitution_count += 1;
+        for span in pending.by_ref() {
+            if span.source_range.start >= source_range.end {
+                break;
             }
-            if matched_len != run_len {
+            if !source_range_contains(source_range, &span.source_range) {
                 return None;
             }
-            plan.push(MaskRun {
-                start,
-                end: start + run_len,
-                substitution_count,
-            });
-            offset = start + run_len;
+            let relative_start = remainder.find(span.marker)?;
+            let start = offset + relative_start;
+            let end = start.checked_add(span.source_range.len())?;
+            let masked = text.get(start..end)?;
+            let mut characters = masked.chars();
+            if characters.next() != Some(span.marker)
+                || !characters.all(|character| character == 'M')
+            {
+                return None;
+            }
+            plan.push(MaskRun { start, end });
+            offset = end;
             remainder = &text[offset..];
-        }
-
-        if pending
-            .next()
-            .is_some_and(|span| source_range_contains(&source_range, &span.source_range))
-        {
-            return None;
         }
         Some(plan)
     }
 
-    fn source_literal(&self, source_range: Range<usize>) -> String {
-        self.source
-            .get(source_range)
-            .map(str::to_string)
-            .unwrap_or_else(|| self.source.to_string())
+    fn source_literal(&self, source_range: Range<usize>) -> &'a str {
+        self.source.get(source_range).unwrap_or(self.source)
     }
 }
 
@@ -154,7 +161,6 @@ fn source_range_contains(event: &Range<usize>, span: &Range<usize>) -> bool {
 struct MaskRun {
     start: usize,
     end: usize,
-    substitution_count: usize,
 }
 
 #[cfg(test)]

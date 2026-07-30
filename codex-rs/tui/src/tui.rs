@@ -41,14 +41,15 @@ pub use self::frame_requester::FrameRequester;
 use crate::custom_terminal;
 use crate::custom_terminal::Terminal as CustomTerminal;
 use crate::insert_history::HistoryLineWrapPolicy;
+use crate::insert_history::InsertHistoryMode;
 use crate::notifications::DesktopNotificationBackend;
 use crate::notifications::detect_backend;
 use crate::terminal_hyperlinks::HyperlinkLine;
+use crate::terminal_hyperlinks::plain_hyperlink_lines;
 use crate::tui::event_stream::EventBroker;
 use crate::tui::event_stream::TuiEventStream;
 #[cfg(unix)]
 use crate::tui::job_control::SuspendContext;
-use crate::tui::pending_history::PendingHistory;
 use codex_config::types::NotificationCondition;
 use codex_config::types::NotificationMethod;
 
@@ -58,7 +59,6 @@ mod frame_requester;
 #[cfg(unix)]
 mod job_control;
 mod keyboard_modes;
-mod pending_history;
 mod terminal_stderr;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -566,7 +566,7 @@ pub struct Tui {
     draw_tx: broadcast::Sender<()>,
     event_broker: Arc<EventBroker>,
     pub(crate) terminal: Terminal,
-    pending_history: PendingHistory,
+    pending_history_lines: Vec<PendingHistoryLines>,
     ambient_pet_image_state: crate::pets::PetImageRenderState,
     pet_picker_preview_image_state: crate::pets::PetImageRenderState,
     alt_saved_viewport: Option<ratatui::layout::Rect>,
@@ -585,6 +585,11 @@ pub struct Tui {
     alt_screen_enabled: bool,
     // Keeps unmanaged process stderr writes out of the inline viewport.
     _stderr_guard: terminal_stderr::TerminalStderrGuard,
+}
+
+struct PendingHistoryLines {
+    lines: Vec<HyperlinkLine>,
+    wrap_policy: HistoryLineWrapPolicy,
 }
 
 fn clear_for_viewport_change<B>(terminal: &mut CustomTerminal<B>, new_area: Rect) -> Result<()>
@@ -618,7 +623,7 @@ impl Tui {
             draw_tx,
             event_broker: Arc::new(EventBroker::new()),
             terminal,
-            pending_history: PendingHistory::default(),
+            pending_history_lines: vec![],
             ambient_pet_image_state: crate::pets::PetImageRenderState::default(),
             pet_picker_preview_image_state: crate::pets::PetImageRenderState::default(),
             alt_saved_viewport: None,
@@ -810,17 +815,12 @@ impl Tui {
         lines: Vec<Line<'static>>,
         wrap_policy: HistoryLineWrapPolicy,
     ) {
-        if lines.is_empty() {
-            return;
-        }
-        self.pending_history.insert_one_shot(lines, wrap_policy);
-        self.frame_requester().schedule_frame();
+        self.insert_history_hyperlink_lines_with_wrap_policy(
+            plain_hyperlink_lines(lines),
+            wrap_policy,
+        );
     }
 
-    /// Queues source-backed transcript rows for insertion into terminal scrollback.
-    ///
-    /// Keeping these rows distinct from headers and diagnostics lets resize recovery replace only
-    /// stale transcript output without silently dropping unrelated pending history.
     pub(crate) fn insert_history_hyperlink_lines_with_wrap_policy(
         &mut self,
         lines: Vec<HyperlinkLine>,
@@ -829,23 +829,19 @@ impl Tui {
         if lines.is_empty() {
             return;
         }
-        self.pending_history.insert_transcript(lines, wrap_policy);
+        if let Some(last) = self.pending_history_lines.last_mut()
+            && last.wrap_policy == wrap_policy
+        {
+            last.lines.extend(lines);
+        } else {
+            self.pending_history_lines
+                .push(PendingHistoryLines { lines, wrap_policy });
+        }
         self.frame_requester().schedule_frame();
     }
 
-    /// Drops queued history and any repair request that referred to those rows.
     pub fn clear_pending_history_lines(&mut self) {
-        self.pending_history.clear();
-    }
-
-    /// Drops queued source-backed rows while preserving one-shot headers and diagnostics.
-    pub(crate) fn discard_pending_transcript_history_lines(&mut self) {
-        self.pending_history.discard_transcript();
-    }
-
-    /// Returns whether a width race deferred image rows that must be rebuilt from transcript cells.
-    pub(crate) fn take_history_source_reflow_needed(&mut self) -> bool {
-        self.pending_history.take_source_reflow_needed()
+        self.pending_history_lines.clear();
     }
 
     /// Resize the inline viewport for the resize-reflow path.
@@ -891,6 +887,33 @@ impl Tui {
         Ok(needs_full_repaint)
     }
 
+    /// Write any buffered history lines above the viewport and clear the buffer.
+    fn flush_pending_history_lines(
+        terminal: &mut Terminal,
+        pending_history_lines: &mut Vec<PendingHistoryLines>,
+        is_zellij: bool,
+    ) -> Result<()> {
+        if pending_history_lines.is_empty() {
+            return Ok(());
+        }
+
+        for batch in pending_history_lines.iter() {
+            let mode = if is_zellij && batch.wrap_policy == HistoryLineWrapPolicy::Terminal {
+                InsertHistoryMode::ZellijRaw
+            } else {
+                InsertHistoryMode::Standard
+            };
+            crate::insert_history::insert_history_hyperlink_lines_with_mode_and_wrap_policy(
+                terminal,
+                &batch.lines,
+                mode,
+                batch.wrap_policy,
+            )?;
+        }
+        pending_history_lines.clear();
+        Ok(())
+    }
+
     pub fn draw(
         &mut self,
         height: u16,
@@ -909,7 +932,7 @@ impl Tui {
 
         ensure_virtual_terminal_processing()?;
 
-        let result = stdout().sync_update(|_| {
+        stdout().sync_update(|_| {
             #[cfg(unix)]
             if let Some(prepared) = prepared_resume.take() {
                 prepared.apply(&mut self.terminal)?;
@@ -940,7 +963,11 @@ impl Tui {
                 terminal.set_viewport_area(area);
             }
 
-            self.pending_history.flush(terminal, self.is_zellij)?;
+            Self::flush_pending_history_lines(
+                terminal,
+                &mut self.pending_history_lines,
+                self.is_zellij,
+            )?;
 
             // Update the y position for suspending so Ctrl-Z can place the cursor correctly.
             #[cfg(unix)]
@@ -959,11 +986,7 @@ impl Tui {
             terminal.draw(|frame| {
                 draw_fn(frame);
             })
-        })?;
-        if self.pending_history.source_reflow_needed() {
-            self.frame_requester().schedule_frame();
-        }
-        result
+        })?
     }
 
     pub fn draw_ambient_pet_image(
@@ -1041,7 +1064,7 @@ impl Tui {
 
         ensure_virtual_terminal_processing()?;
 
-        let result = stdout().sync_update(|_| {
+        stdout().sync_update(|_| {
             #[cfg(unix)]
             if let Some(prepared) = prepared_resume.take() {
                 prepared.apply(&mut self.terminal)?;
@@ -1050,7 +1073,11 @@ impl Tui {
             let terminal = &mut self.terminal;
             let needs_full_repaint =
                 Self::update_inline_viewport_for_resize_reflow(terminal, height)?;
-            self.pending_history.flush(terminal, self.is_zellij)?;
+            Self::flush_pending_history_lines(
+                terminal,
+                &mut self.pending_history_lines,
+                self.is_zellij,
+            )?;
 
             if needs_full_repaint {
                 terminal.invalidate_viewport();
@@ -1073,11 +1100,7 @@ impl Tui {
             terminal.draw(|frame| {
                 draw_fn(frame);
             })
-        })?;
-        if self.pending_history.source_reflow_needed() {
-            self.frame_requester().schedule_frame();
-        }
-        result
+        })?
     }
 
     fn pending_viewport_area(&mut self) -> Result<Option<Rect>> {

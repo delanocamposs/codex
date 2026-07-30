@@ -34,14 +34,15 @@ fn plain_lines(text: &Text<'_>) -> Vec<String> {
 #[test]
 fn standalone_display_math_literal_fallback_snapshot() {
     let rendered = render_markdown_text(
-        "Before.\n\n\\[\n\\text{fluid acceleration}\n=\n\\text{pressure forces}\n+\\text{viscous forces}\n\\]\n\nAfter.",
+        "Before.\n\n\\[\n  \\text{fluid acceleration}\n\n=\n\\text{pressure forces}\n+\\text{viscous forces}\n\\]\n\nAfter.",
     );
 
     assert_snapshot!(plain_lines(&rendered).join("\n"), @r"
     Before.
 
     \[
-    \text{fluid acceleration}
+      \text{fluid acceleration}
+
     =
     \text{pressure forces}
     +\text{viscous forces}
@@ -49,6 +50,17 @@ fn standalone_display_math_literal_fallback_snapshot() {
 
     After.
     ");
+}
+
+#[test]
+fn display_math_does_not_consume_its_paragraph_events() {
+    let source = "Before.\n\\[\nx\n\\]\nAfter.";
+    let rendered = render_markdown_text(source);
+
+    assert_eq!(
+        plain_lines(&rendered),
+        vec!["Before.", "\\[", "x", "\\]", "After."]
+    );
 }
 
 #[test]
@@ -68,19 +80,88 @@ fn explicit_inline_math_literal_fallback_preserves_source_and_tex_punctuation() 
 }
 
 #[test]
-fn inline_math_literal_fallback_preserves_source_when_every_mask_is_occupied() {
-    let occupied_masks = (1u8..=31)
-        .filter(|candidate| !candidate.is_ascii_whitespace())
-        .chain(std::iter::once(127))
-        .chain(b'A'..=b'Z')
-        .chain(b'a'..=b'z')
-        .chain(b'0'..=b'9')
-        .map(char::from)
-        .collect::<String>();
-    let source = format!("{occupied_masks} before \\(x\\) after");
-    let rendered = render_markdown_text_with_width(&source, /*width*/ None);
+fn inline_math_mask_does_not_conflict_with_decoded_entities() {
+    let source = "&#65; \\(x\\)";
+    let rendered = render_markdown_text_with_width(source, /*width*/ None);
 
-    assert_eq!(plain_lines(&rendered), vec![source]);
+    assert_eq!(plain_lines(&rendered), vec!["A \\(x\\)"]);
+}
+
+#[test]
+fn math_delimiters_in_an_autolink_do_not_change_its_destination() {
+    let destination = r"https://example.com/\(path\)";
+    let source = format!("<{destination}>");
+    let lines = render_markdown_lines_with_width_and_cwd(
+        &source,
+        /*width*/ Some(80),
+        /*cwd*/ None,
+    );
+    let rendered = lines
+        .iter()
+        .map(|line| {
+            let text = line
+                .line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            let hyperlinks = line
+                .hyperlinks
+                .iter()
+                .map(|link| (link.columns.clone(), link.destination.as_str()))
+                .collect::<Vec<_>>();
+            (text, hyperlinks)
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        rendered,
+        vec![(
+            format!("{destination} ({destination})"),
+            vec![
+                (0..destination.len(), destination),
+                (
+                    destination.len() + 2..destination.len() * 2 + 2,
+                    destination,
+                ),
+            ],
+        )],
+    );
+}
+
+#[test]
+fn math_masks_do_not_change_opaque_markdown_structure() {
+    for source in [
+        r"<\(x\)>",
+        r"<\(x\):y>",
+        r"<\(x\)@example.com>",
+        r"<foo@\(x y\).com>",
+        "[\\(x\\)]\n\n[aaaaa]: https://example.com",
+        "ABCDEFGHIJKLMNOPQR\n[\\(x\\)]\n\n[ſſſſſ]: /url",
+    ] {
+        let lines = render_markdown_lines_with_width_and_cwd(
+            source,
+            /*width*/ Some(80),
+            /*cwd*/ None,
+        );
+        assert_eq!(
+            (
+                lines
+                    .iter()
+                    .map(|line| line.line.to_string())
+                    .collect::<Vec<_>>(),
+                lines
+                    .iter()
+                    .flat_map(|line| &line.hyperlinks)
+                    .count(),
+            ),
+            (
+                source.lines().map(str::to_string).collect::<Vec<_>>(),
+                0,
+            ),
+            "{source:?}",
+        );
+    }
 }
 
 #[test]

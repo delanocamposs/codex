@@ -10,6 +10,7 @@ use super::inline_math::InlineMathText;
 use super::word_wrap_hyperlink_line;
 use crate::markdown_text_merge::DecodedTextMerge;
 use crate::terminal_hyperlinks::HyperlinkLine;
+use crate::terminal_hyperlinks::TerminalHyperlink;
 use pulldown_cmark::Event;
 use pulldown_cmark::Options;
 use pulldown_cmark::Parser;
@@ -28,21 +29,32 @@ pub(crate) fn render_markdown_lines(
     input: &str,
     render_options: MarkdownRenderOptions<'_>,
 ) -> Vec<HyperlinkLine> {
+    render_prepared_markdown_lines(crate::math_source::PreparedMath::new(input), render_options)
+}
+
+pub(crate) fn render_prepared_markdown_lines(
+    prepared_math: crate::math_source::PreparedMath<'_>,
+    render_options: MarkdownRenderOptions<'_>,
+) -> Vec<HyperlinkLine> {
     let MarkdownRenderOptions {
         width,
         cwd,
         is_hidden_link_destination,
         latex_renderer,
     } = render_options;
+    if prepared_math.renders_literal() {
+        return render_literal_lines(prepared_math.source(), width);
+    }
     let mut parser_options = Options::empty();
     parser_options.insert(Options::ENABLE_STRIKETHROUGH);
     parser_options.insert(Options::ENABLE_TABLES);
-    let prepared_inline_math = crate::inline_math::PreparedInlineMath::new(input);
-    if prepared_inline_math.renders_literal() {
-        return render_literal_lines(input, width);
-    }
-    let (markdown, inline_math_mask, inline_math_spans, display_math) =
-        prepared_inline_math.into_parts();
+    let crate::math_source::PreparedMathParts {
+        source,
+        markdown,
+        inline,
+        display,
+    } = prepared_math.into_parts();
+    let input = source.as_ref();
     let parser =
         DecodedTextMerge::new(Parser::new_ext(&markdown, parser_options).into_offset_iter());
     let mut writer = Writer::new(
@@ -51,13 +63,11 @@ pub(crate) fn render_markdown_lines(
         width,
         cwd,
         is_hidden_link_destination,
-        InlineMathCursor::new(input, inline_math_mask, inline_math_spans),
+        InlineMathCursor::new(input, inline),
     );
     writer.latex_renderer =
         latex_renderer.map(crate::latex_renderer::LatexRenderHandle::for_render_pass);
-    if !writer.run(display_math) {
-        return render_literal_lines(input, width);
-    }
+    writer.run(display);
     writer.text
 }
 
@@ -81,14 +91,24 @@ impl<'a, 'policy, I> Writer<'a, 'policy, I>
 where
     I: Iterator<Item = (Event<'a>, Range<usize>)>,
 {
-    pub(super) fn run(
-        &mut self,
-        display_math: Vec<crate::display_math::DisplayMathSpan<'a>>,
-    ) -> bool {
+    pub(super) fn run(&mut self, display_math: Vec<crate::math_source::DisplayMathSpan>) {
         let mut display_math = display_math.into_iter().peekable();
-        let mut active_display_math = None;
+        let mut active_display_math: Option<Range<usize>> = None;
         while let Some((event, range)) = self.iter.next() {
-            let is_display_math_content = matches!(
+            if let Some(active) = active_display_math.as_ref() {
+                let belongs_to_display = active.start <= range.start
+                    && range.start < active.end
+                    && (range.end <= active.end
+                        || self.input[active.end..range.end].trim().is_empty());
+                if belongs_to_display
+                    || range.start == active.end
+                        && matches!(&event, Event::SoftBreak | Event::HardBreak)
+                {
+                    continue;
+                }
+                active_display_math = None;
+            }
+            let is_leaf_content = matches!(
                 &event,
                 Event::Text(_)
                     | Event::Code(_)
@@ -96,41 +116,28 @@ where
                     | Event::HardBreak
                     | Event::InlineHtml(_)
             );
-            if is_display_math_content
-                && active_display_math
-                    .as_ref()
-                    .is_some_and(|active: &Range<usize>| {
-                        (range.start < active.end && active.start < range.end)
-                            || (range.start == active.end
-                                && matches!(&event, Event::SoftBreak | Event::HardBreak))
-                    })
+            if is_leaf_content
+                && let Some(span) = display_math.peek()
+                && range.start < span.source_range.end
+                && span.source_range.start < range.end
+                && let Some(span) = display_math.next()
             {
-                continue;
-            }
-            active_display_math = None;
-            if is_display_math_content
-                && display_math.peek().is_some_and(|span| {
-                    range.start < span.source_range.end && span.source_range.start < range.end
-                })
-            {
-                let Some(span) = display_math.next() else {
-                    return false;
-                };
+                debug_assert_eq!(range.start, span.source_range.start);
                 active_display_math = Some(span.source_range.clone());
-                self.display_math_block(span.raw_block, span.formula);
+                self.display_math_block(span);
                 continue;
             }
             self.handle_event(event, range);
         }
         debug_assert!(
             self.inline_math.is_complete(),
-            "every inline-math source span must be consumed"
+            "every parser-accepted inline formula must be consumed"
         );
         self.flush_current_line();
-        display_math.next().is_none()
+        debug_assert!(display_math.next().is_none());
     }
 
-    fn display_math_block(&mut self, raw_block: &str, formula: &str) {
+    fn display_math_block(&mut self, span: crate::math_source::DisplayMathSpan) {
         let reuse_empty_line = !self.needs_newline
             && self.current_line_content.as_ref().is_some_and(|line| {
                 line.line.spans.is_empty()
@@ -139,7 +146,7 @@ where
             });
         let rendered = self.latex_renderer.as_ref().and_then(|renderer| {
             renderer.render(
-                formula,
+                &span.formula,
                 u16::try_from(self.max_text_math_columns()).unwrap_or(u16::MAX),
             )
         });
@@ -160,26 +167,8 @@ where
                 self.flush_current_line();
             }
         } else {
-            let structural_indent = raw_block
-                .rsplit('\n')
-                .next()
-                .unwrap_or_default()
-                .bytes()
-                .take_while(|byte| matches!(byte, b' ' | b'\t'))
-                .count();
-            for (index, line) in raw_block.split('\n').enumerate() {
-                let line = line.strip_suffix('\r').unwrap_or(line);
-                let line = if index == 0 {
-                    line
-                } else {
-                    line.get(structural_indent..)
-                        .filter(|_| {
-                            line.as_bytes()[..structural_indent]
-                                .iter()
-                                .all(|byte| matches!(byte, b' ' | b'\t'))
-                        })
-                        .unwrap_or(line)
-                };
+            let literal = span.literal(self.input);
+            for (index, line) in literal.split('\n').enumerate() {
                 let line = Line::from(line.to_string());
                 if reuse_empty_line && index == 0 {
                     self.current_line_content = Some(HyperlinkLine::new(line));
@@ -196,12 +185,14 @@ where
     pub(super) fn push_text_with_inline_math(&mut self, text: &str, source_range: Range<usize>) {
         match self.inline_math.consume(text, source_range) {
             InlineMathText::Plain(text) => self.push_decoded_text(text),
-            InlineMathText::SourceLiteral(text) => self.push_decoded_text(&text),
+            InlineMathText::SourceLiteral(text) => self.push_decoded_text(text),
             InlineMathText::Segmented(segments) => {
                 for segment in segments {
                     match segment {
                         InlineMathSegment::Text(text) => self.push_decoded_text(text),
-                        InlineMathSegment::Math(span) => self.render_inline_math(span),
+                        InlineMathSegment::Math { raw, formula } => {
+                            self.render_inline_math(raw, formula);
+                        }
                     }
                 }
             }
@@ -231,11 +222,11 @@ where
         }
     }
 
-    fn render_inline_math(&mut self, span: crate::inline_math::InlineMathSpan) {
-        if self.link.is_some() {
-            self.push_decoded_text(&span.raw);
-            return;
-        }
+    fn render_inline_math(&mut self, raw: &str, formula: &str) {
+        debug_assert!(
+            !self.in_code_block,
+            "the source parser must not accept math inside code"
+        );
         let in_table_cell = self.in_table_cell();
         let max_columns = if in_table_cell {
             let column_count = self
@@ -254,12 +245,19 @@ where
             self.max_text_math_columns()
         };
         let rendered = self.latex_renderer.as_ref().and_then(|renderer| {
-            renderer.render_inline(
-                &span.formula,
-                u16::try_from(max_columns).unwrap_or(u16::MAX),
-            )
+            renderer.render_inline(formula, u16::try_from(max_columns).unwrap_or(u16::MAX))
         });
-        if let Some(rendered) = rendered {
+        if let Some(mut rendered) = rendered {
+            if let Some(destination) = self
+                .link
+                .as_ref()
+                .and_then(|link| super::web_destination(&link.destination))
+            {
+                let width = rendered.width();
+                rendered
+                    .hyperlinks
+                    .push(TerminalHyperlink::web(0..width, destination));
+            }
             if let Some(table_state) = self.table_state.as_mut()
                 && let Some(cell) = table_state.current_cell.as_mut()
             {
@@ -268,7 +266,7 @@ where
                 self.push_annotated(rendered);
             }
         } else {
-            self.push_decoded_text(&span.raw);
+            self.push_decoded_text(raw);
         }
     }
 

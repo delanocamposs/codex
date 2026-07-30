@@ -1913,7 +1913,6 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
             &mut tui,
             resumed,
             crate::app::session_lifecycle::ThreadAttachPresentation::SessionLineage,
-            crate::app::session_lifecycle::ThreadUiReset::Required,
             /*initial_user_message*/ None,
         )
         .await?;
@@ -5398,13 +5397,18 @@ async fn thread_switch_replay_buffer_uses_transcript_tail_mode_when_row_cap_pres
 }
 
 #[tokio::test]
-async fn thread_switch_replay_buffer_is_disabled_without_row_cap() {
+async fn thread_switch_replay_buffer_does_not_defer_without_row_cap() {
     let (mut app, _rx, _op_rx) = make_test_app_with_channels().await;
     app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Disabled;
 
     app.begin_thread_switch_history_replay_buffer();
 
-    assert!(app.initial_history_replay_buffer.is_none());
+    let buffer = app
+        .initial_history_replay_buffer
+        .as_ref()
+        .expect("thread-switch replay marker");
+    assert!(!buffer.render_from_transcript_tail);
+    assert!(buffer.retained_lines.is_empty());
 }
 
 #[tokio::test]

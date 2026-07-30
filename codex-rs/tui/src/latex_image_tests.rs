@@ -24,16 +24,16 @@ fn formula_admission_trims_and_bounds_input() {
 
     assert_eq!(
         [
-            ValidatedLatexFormula::new("  x^2  "),
-            ValidatedLatexFormula::new("   "),
-            ValidatedLatexFormula::new(&oversized),
-            ValidatedLatexFormula::new(r"\text{naïve}"),
+            AdmissibleLatexFormula::new("  x^2  "),
+            AdmissibleLatexFormula::new("   "),
+            AdmissibleLatexFormula::new(&oversized),
+            AdmissibleLatexFormula::new(r"\text{naïve}"),
         ],
         [
-            Ok(ValidatedLatexFormula("x^2".into())),
+            Ok(AdmissibleLatexFormula("x^2".into())),
             Err(LatexImageError::InvalidFormula("formula is empty")),
             Err(LatexImageError::InvalidFormula("formula is too long")),
-            Ok(ValidatedLatexFormula(r"\text{naïve}".into())),
+            Ok(AdmissibleLatexFormula(r"\text{naïve}".into())),
         ],
     );
 }
@@ -55,7 +55,7 @@ fn formula_admission_rejects_custom_macro_definitions() {
     ] {
         let formula = format!(r"\{control}\foo{{{}}}", "x".repeat(1024));
         assert_eq!(
-            ValidatedLatexFormula::new(&formula),
+            AdmissibleLatexFormula::new(&formula),
             Err(LatexImageError::InvalidFormula(
                 "custom macro definitions are not allowed"
             )),
@@ -71,8 +71,8 @@ fn formula_admission_rejects_custom_macro_definitions() {
         r"\definitelyUnknown{x}",
     ] {
         assert_eq!(
-            ValidatedLatexFormula::new(formula),
-            Ok(ValidatedLatexFormula(formula.into())),
+            AdmissibleLatexFormula::new(formula),
+            Ok(AdmissibleLatexFormula(formula.into())),
             "formula {formula}",
         );
     }
@@ -80,7 +80,7 @@ fn formula_admission_rejects_custom_macro_definitions() {
     let amplification = format!(r"\def\a{{{}}}{}", "x".repeat(8 * 1024), r"\a".repeat(900));
     assert!(amplification.len() < MAX_FORMULA_BYTES);
     assert_eq!(
-        ValidatedLatexFormula::new(&amplification),
+        AdmissibleLatexFormula::new(&amplification),
         Err(LatexImageError::InvalidFormula(
             "custom macro definitions are not allowed"
         )),
@@ -89,8 +89,8 @@ fn formula_admission_rejects_custom_macro_definitions() {
 
 #[test]
 fn ratex_renders_a_transparent_colored_png() {
-    let formula =
-        ValidatedLatexFormula::new(r"\frac{-b \pm \sqrt{b^2-4ac}}{2a}").expect("valid formula");
+    let formula = AdmissibleLatexFormula::new(r"\frac{-b \pm \sqrt{b^2-4ac}}{2a}")
+        .expect("admissible formula");
 
     let png = render_formula(
         &formula,
@@ -127,7 +127,7 @@ fn ratex_accepts_representative_display_math() {
     ];
 
     for formula in formulas {
-        let formula = ValidatedLatexFormula::new(formula).expect("valid formula");
+        let formula = AdmissibleLatexFormula::new(formula).expect("admissible formula");
         render_formula(
             &formula,
             LatexRenderStyle::Display,
@@ -140,7 +140,7 @@ fn ratex_accepts_representative_display_math() {
 
 #[test]
 fn ratex_uses_text_style_for_inline_math() {
-    let formula = ValidatedLatexFormula::new(r"\sum_{i=1}^{n} i").expect("valid formula");
+    let formula = AdmissibleLatexFormula::new(r"\sum_{i=1}^{n} i").expect("admissible formula");
 
     let display = render_formula(
         &formula,
@@ -169,7 +169,7 @@ fn ratex_uses_text_style_for_inline_math() {
 
 #[test]
 fn ratex_raster_dimensions_follow_terminal_cell_scale() {
-    let formula = ValidatedLatexFormula::new(r"\frac{x}{y}").expect("valid formula");
+    let formula = AdmissibleLatexFormula::new(r"\frac{x}{y}").expect("admissible formula");
 
     for style in [LatexRenderStyle::Display, LatexRenderStyle::Inline] {
         let reference = render_formula(&formula, style, /*cell_height*/ 32, [255, 255, 255])
@@ -190,7 +190,8 @@ fn ratex_raster_dimensions_follow_terminal_cell_scale() {
 
 #[test]
 fn ratex_parse_errors_fall_back_without_a_png() {
-    let formula = ValidatedLatexFormula::new(r"\definitelyUnknown{x}").expect("bounded formula");
+    let formula =
+        AdmissibleLatexFormula::new(r"\definitelyUnknown{x}").expect("admissible formula");
 
     assert!(matches!(
         render_formula(
@@ -205,7 +206,7 @@ fn ratex_parse_errors_fall_back_without_a_png() {
 
 #[test]
 fn renderer_rejects_system_font_fallback() {
-    let formula = ValidatedLatexFormula::new(r#"\char"4E00"#).expect("bounded formula");
+    let formula = AdmissibleLatexFormula::new(r#"\char"4E00"#).expect("admissible formula");
 
     assert!(matches!(
         render_formula(
@@ -278,7 +279,7 @@ fn png_validation_enforces_bytes_and_dimensions() {
 #[test]
 fn inline_strut_keeps_ordinary_formulas_at_one_scale() {
     let heights = ["x", r"\delta(x)", r"f'"].map(|source| {
-        let formula = ValidatedLatexFormula::new(source).expect("valid formula");
+        let formula = AdmissibleLatexFormula::new(source).expect("admissible formula");
         render_formula(
             &formula,
             LatexRenderStyle::Inline,

@@ -17,10 +17,6 @@ use std::time::Duration;
 #[cfg(unix)]
 mod kitty;
 
-// The complete startup reply batch is normally well under 1 KiB. Keep enough trailing input for
-// split replies and modest unrelated noise without letting an exclusive probe accumulate input.
-const MAX_PROBE_BUFFER_BYTES: usize = 4 * 1024;
-
 /// Default wall-clock budget for each startup probe group.
 pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -153,28 +149,30 @@ mod imp {
 
         fn read_available(&mut self, buffer: &mut Vec<u8>) -> io::Result<()> {
             let mut chunk = [0_u8; 256];
-            let count = unsafe {
-                libc::read(
-                    self.reader.as_raw_fd(),
-                    chunk.as_mut_ptr().cast::<libc::c_void>(),
-                    chunk.len(),
-                )
-            };
-            if count > 0 {
-                super::append_probe_bytes(buffer, &chunk[..count as usize]);
-                return Ok(());
+            loop {
+                let count = unsafe {
+                    libc::read(
+                        self.reader.as_raw_fd(),
+                        chunk.as_mut_ptr().cast::<libc::c_void>(),
+                        chunk.len(),
+                    )
+                };
+                if count > 0 {
+                    buffer.extend_from_slice(&chunk[..count as usize]);
+                    continue;
+                }
+                if count == 0 {
+                    return Ok(());
+                }
+                let err = io::Error::last_os_error();
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) {
+                    return Ok(());
+                }
+                return Err(err);
             }
-            if count == 0 {
-                return Ok(());
-            }
-            let err = io::Error::last_os_error();
-            if matches!(
-                err.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-            ) {
-                return Ok(());
-            }
-            Err(err)
         }
 
         fn poll_readable(&self, timeout: Duration) -> io::Result<bool> {
@@ -263,25 +261,23 @@ mod imp {
         let kitty_graphics_probe = kitty::startup_version_probe();
         let mut tty = Tty::open()?;
         let mut query = kitty_graphics_probe.query_bytes().to_vec();
-        query.extend_from_slice(&startup_query(keyboard_probe));
+        match keyboard_probe {
+            StartupKeyboardEnhancementProbe::Query => {
+                query.extend_from_slice(b"\x1B[6n\x1B]10;?\x1B\\\x1B]11;?\x1B\\\x1B[?u\x1B[c");
+            }
+            StartupKeyboardEnhancementProbe::Skip => {
+                query.extend_from_slice(b"\x1B[6n\x1B]10;?\x1B\\\x1B]11;?\x1B\\");
+            }
+        }
         tty.write_all(&query)?;
         read_startup_probe(&mut tty, timeout, keyboard_probe, kitty_graphics_probe)
     }
 
-    fn startup_query(keyboard_probe: StartupKeyboardEnhancementProbe) -> Vec<u8> {
-        let mut query = b"\x1B[6n\x1B]10;?\x1B\\\x1B]11;?\x1B\\".to_vec();
-        query.extend_from_slice(match keyboard_probe {
-            StartupKeyboardEnhancementProbe::Query => b"\x1B[?u\x1B[c",
-            StartupKeyboardEnhancementProbe::Skip => b"",
-        });
-        query
-    }
-
     /// Reads available terminal bytes until `parse` recognizes a probe response or time expires.
     ///
-    /// The bounded rolling buffer may include unrelated terminal input. This helper intentionally
-    /// does not try to replay those bytes, so callers must use it only during short, exclusive
-    /// probe windows before normal crossterm input polling begins or while that polling is paused.
+    /// The accumulated buffer may include unrelated terminal input. This helper intentionally does
+    /// not try to replay those bytes, so callers must use it only during short, exclusive probe
+    /// windows before normal crossterm input polling begins or while that polling is paused.
     fn read_until<T>(
         tty: &mut Tty,
         timeout: Duration,
@@ -546,18 +542,6 @@ mod imp {
             assert_eq!(
                 parse_keyboard_enhancement_support(b""),
                 KeyboardProbeState::Pending
-            );
-        }
-
-        #[test]
-        fn startup_query_omits_keyboard_bytes_when_probe_is_disabled() {
-            assert_eq!(
-                startup_query(StartupKeyboardEnhancementProbe::Skip),
-                b"\x1B[6n\x1B]10;?\x1B\\\x1B]11;?\x1B\\"
-            );
-            assert_eq!(
-                startup_query(StartupKeyboardEnhancementProbe::Query),
-                b"\x1B[6n\x1B]10;?\x1B\\\x1B]11;?\x1B\\\x1B[?u\x1B[c"
             );
         }
 
@@ -859,7 +843,7 @@ mod imp {
         if ok == 0 {
             return Err(io::Error::last_os_error());
         }
-        super::append_probe_bytes(buffer, &chunk[..read as usize]);
+        buffer.extend_from_slice(&chunk[..read as usize]);
         Ok(())
     }
 
@@ -930,21 +914,6 @@ mod imp {
     }
 }
 
-fn append_probe_bytes(buffer: &mut Vec<u8>, bytes: &[u8]) {
-    if bytes.len() >= MAX_PROBE_BUFFER_BYTES {
-        buffer.clear();
-        buffer.extend_from_slice(&bytes[bytes.len() - MAX_PROBE_BUFFER_BYTES..]);
-        return;
-    }
-
-    let overflow = buffer
-        .len()
-        .saturating_add(bytes.len())
-        .saturating_sub(MAX_PROBE_BUFFER_BYTES);
-    buffer.drain(..overflow);
-    buffer.extend_from_slice(bytes);
-}
-
 fn parse_osc_color(buffer: &[u8], slot: u8) -> Option<(u8, u8, u8)> {
     let prefix = format!("\x1B]{slot};");
     let start = find_subslice(buffer, prefix.as_bytes())?;
@@ -1012,17 +981,6 @@ pub(crate) use imp::*;
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
-
-    #[test]
-    fn probe_buffer_is_bounded_and_retains_recent_bytes() {
-        let mut buffer = vec![b'x'; MAX_PROBE_BUFFER_BYTES];
-        let recent = b"\x1BP>|kitty(0.48.1)\x1B\\";
-        append_probe_bytes(&mut buffer, recent);
-
-        let mut expected = vec![b'x'; MAX_PROBE_BUFFER_BYTES - recent.len()];
-        expected.extend_from_slice(recent);
-        assert_eq!(buffer, expected);
-    }
 
     #[test]
     fn parses_osc_colors_with_bel_and_st() {
