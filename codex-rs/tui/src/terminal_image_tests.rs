@@ -61,35 +61,6 @@ fn tmux_passthrough_wraps_and_escapes_control_sequence() {
 }
 
 #[test]
-fn unicode_placeholder_versions_are_supported_conservatively() {
-    let cases = [
-        (
-            KittyGraphicsTerminal::Kitty {
-                version: (0, 28, 0),
-            },
-            true,
-        ),
-        (
-            KittyGraphicsTerminal::Kitty {
-                version: (0, 27, 1),
-            },
-            false,
-        ),
-        (KittyGraphicsTerminal::Ghostty { version: (1, 3, 1) }, true),
-        (
-            KittyGraphicsTerminal::Ghostty {
-                version: (0, 99, 0),
-            },
-            false,
-        ),
-    ];
-
-    for (terminal, expected) in cases {
-        assert_eq!(terminal.unicode_placeholders_supported(), expected);
-    }
-}
-
-#[test]
 fn image_data_is_transmitted_once_and_each_geometry_gets_one_placement() {
     let png = Arc::<[u8]>::from(b"png".as_slice());
     let image = KittyImage::new(

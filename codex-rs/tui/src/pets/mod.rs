@@ -32,6 +32,11 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 
 use crate::tui::FrameRequester;
 
+#[cfg(test)]
+pub(crate) use crate::terminal_graphics::ImageProtocol;
+pub(crate) use crate::terminal_graphics::PetImageSupport;
+#[cfg(test)]
+pub(crate) use crate::terminal_graphics::PetImageUnsupportedReason;
 pub(crate) use ambient::AmbientPet;
 pub(crate) use ambient::AmbientPetDraw;
 pub(crate) use ambient::PetNotificationKind;
@@ -40,13 +45,6 @@ pub(crate) use ambient::test_ambient_pet;
 pub(crate) use asset_pack::builtin_spritesheet_path;
 #[cfg(test)]
 pub(crate) use asset_pack::write_test_pack;
-#[cfg(test)]
-pub(crate) use image_protocol::ImageProtocol;
-pub(crate) use image_protocol::PetImageSupport;
-#[cfg(test)]
-pub(crate) use image_protocol::PetImageUnsupportedReason;
-#[cfg(not(test))]
-pub(crate) use image_protocol::detect_pet_image_support;
 pub(crate) use picker::PET_PICKER_VIEW_ID;
 pub(crate) use picker::build_pet_picker_params;
 pub(crate) use preview::PetPickerPreviewState;

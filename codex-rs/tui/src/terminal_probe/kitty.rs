@@ -1,12 +1,6 @@
 //! Kitty-graphics startup probe policy and XTVERSION parsing.
 
-use std::env;
-
-use codex_terminal_detection::TerminalName;
-use codex_terminal_detection::terminal_info;
-
-use crate::terminal_image::KittyGraphicsTerminal;
-use crate::terminal_image::multiplexer_environment_present;
+use crate::terminal_graphics::KittyGraphicsTerminal;
 
 const XTVERSION_QUERY: &[u8] = b"\x1B[>0q";
 
@@ -56,19 +50,7 @@ impl StartupVersionProbe {
 }
 
 pub(super) fn startup_version_probe() -> StartupVersionProbe {
-    if env::var_os("NO_COLOR").is_some() || multiplexer_environment_present() {
-        return StartupVersionProbe::skip();
-    }
-
-    let info = terminal_info();
-    let terminal_hint = env::var_os("TERM").is_some_and(|value| {
-        let value = value.to_string_lossy().to_ascii_lowercase();
-        value.contains("kitty") || value.contains("ghostty")
-    });
-    if matches!(info.name, TerminalName::Kitty | TerminalName::Ghostty)
-        || env::var_os("KITTY_WINDOW_ID").is_some()
-        || terminal_hint
-    {
+    if crate::terminal_graphics::kitty_version_probe_needed() {
         StartupVersionProbe::query()
     } else {
         StartupVersionProbe::skip()

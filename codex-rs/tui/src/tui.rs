@@ -461,7 +461,7 @@ pub(crate) fn init() -> Result<InitializedTerminal> {
     #[cfg(unix)]
     crate::terminal_palette::set_default_colors_from_startup_probe(startup_probe.default_colors);
     #[cfg(unix)]
-    crate::terminal_image::set_kitty_graphics_terminal_from_startup_probe(
+    crate::terminal_graphics::set_kitty_graphics_terminal_from_startup_probe(
         startup_probe.kitty_graphics_terminal,
     );
 

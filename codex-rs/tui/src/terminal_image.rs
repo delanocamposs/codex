@@ -12,7 +12,6 @@ use std::io;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -22,34 +21,7 @@ use base64::engine::general_purpose;
 const ESC: &str = "\x1b";
 const ST: &str = "\x1b\\";
 const KITTY_CHUNK_SIZE: usize = 4096;
-const KITTY_UNICODE_PLACEHOLDER_MIN_VERSION: (u64, u64, u64) = (0, 28, 0);
-const GHOSTTY_UNICODE_PLACEHOLDER_MIN_VERSION: (u64, u64, u64) = (1, 0, 0);
 const KITTY_PLACEHOLDER_MAX_COLUMNS: u16 = 240;
-const MULTIPLEXER_ENV_VARS: [&str; 6] = [
-    "TMUX",
-    "TMUX_PANE",
-    "ZELLIJ",
-    "ZELLIJ_SESSION_NAME",
-    "ZELLIJ_VERSION",
-    "STY",
-];
-static STARTUP_KITTY_GRAPHICS_TERMINAL: OnceLock<Option<KittyGraphicsTerminal>> = OnceLock::new();
-
-/// A directly probed terminal that implements the Kitty graphics protocol.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum KittyGraphicsTerminal {
-    Kitty { version: (u64, u64, u64) },
-    Ghostty { version: (u64, u64, u64) },
-}
-
-impl KittyGraphicsTerminal {
-    fn unicode_placeholders_supported(self) -> bool {
-        match self {
-            Self::Kitty { version } => version >= KITTY_UNICODE_PLACEHOLDER_MIN_VERSION,
-            Self::Ghostty { version } => version >= GHOSTTY_UNICODE_PLACEHOLDER_MIN_VERSION,
-        }
-    }
-}
 
 /// An in-memory PNG and the dimensions of its Kitty virtual placement.
 #[derive(Clone, Eq, PartialEq)]
@@ -243,32 +215,6 @@ impl KittyImageRegistries {
 enum KittyPlacement {
     Direct,
     UnicodePlaceholder { placement_id: u32 },
-}
-
-pub(crate) fn set_kitty_graphics_terminal_from_startup_probe(
-    terminal: Option<KittyGraphicsTerminal>,
-) {
-    let _ = STARTUP_KITTY_GRAPHICS_TERMINAL.set(terminal);
-}
-
-/// Returns whether this process is running directly in a terminal with Kitty Unicode placeholders.
-///
-/// Multiplexers are intentionally rejected: virtual placements can escape pane boundaries or
-/// become detached from the scrollback rows that carry their placeholders.
-pub(crate) fn kitty_unicode_placeholders_supported() -> bool {
-    env::var_os("NO_COLOR").is_none()
-        && !multiplexer_environment_present()
-        && STARTUP_KITTY_GRAPHICS_TERMINAL
-            .get()
-            .copied()
-            .flatten()
-            .is_some_and(KittyGraphicsTerminal::unicode_placeholders_supported)
-}
-
-pub(crate) fn multiplexer_environment_present() -> bool {
-    MULTIPLEXER_ENV_VARS
-        .into_iter()
-        .any(|name| env::var_os(name).is_some())
 }
 
 pub(crate) fn kitty_delete_image(image_id: u32) -> String {

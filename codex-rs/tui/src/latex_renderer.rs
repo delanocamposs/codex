@@ -93,7 +93,11 @@ pub(crate) struct LatexRenderer {
 
 impl LatexRenderer {
     pub(crate) fn new(app_event_tx: mpsc::UnboundedSender<AppEvent>) -> Option<Self> {
-        if !cfg!(unix) || !crate::terminal_image::kitty_unicode_placeholders_supported() {
+        if !cfg!(unix)
+            || crate::terminal_graphics::detect_terminal_graphics_support()
+                .transcript_images()
+                .is_none()
+        {
             return None;
         }
         Self::start(

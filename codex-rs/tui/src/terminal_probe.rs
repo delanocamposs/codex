@@ -47,7 +47,7 @@ mod imp {
     use crossterm::event::KeyboardEnhancementFlags;
     use ratatui::layout::Position;
 
-    use crate::terminal_image::KittyGraphicsTerminal;
+    use crate::terminal_graphics::KittyGraphicsTerminal;
 
     /// Results from the TUI's one-shot startup terminal probe.
     #[derive(Debug, Clone, Copy, Eq, PartialEq)]

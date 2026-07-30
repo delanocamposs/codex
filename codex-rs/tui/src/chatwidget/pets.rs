@@ -190,7 +190,7 @@ impl ChatWidget {
         );
 
         #[cfg(not(test))]
-        crate::pets::detect_pet_image_support()
+        crate::terminal_graphics::detect_terminal_graphics_support().pet_images()
     }
 
     /// Set the pet preselected by the TUI picker in the widget's config copy.
