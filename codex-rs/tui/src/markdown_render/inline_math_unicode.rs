@@ -34,7 +34,36 @@ impl<'a> Parser<'a> {
                     self.bump();
                     output.push_str(&self.sequence(Some('}'))?);
                 }
-                '\\' => output.push_str(&self.command()?),
+                '\\' => {
+                    let (command, named_function) = self.command()?;
+                    if named_function
+                        && output
+                            .chars()
+                            .next_back()
+                            .is_some_and(needs_space_before_named_function)
+                    {
+                        output.push(' ');
+                    }
+                    output.push_str(&command);
+                    if named_function {
+                        loop {
+                            while self.peek().is_some_and(char::is_whitespace) {
+                                self.bump();
+                            }
+                            let Some(character @ ('^' | '_')) = self.peek() else {
+                                break;
+                            };
+                            self.bump();
+                            output.push_str(&self.script(character == '^')?);
+                        }
+                        let needs_separator = self
+                            .peek()
+                            .is_some_and(|character| !matches!(character, '(' | '['));
+                        if needs_separator {
+                            output.push(' ');
+                        }
+                    }
+                }
                 '^' | '_' => {
                     if output.is_empty() {
                         return None;
@@ -69,11 +98,11 @@ impl<'a> Parser<'a> {
         closing.is_none().then_some(output)
     }
 
-    fn command(&mut self) -> Option<String> {
+    fn command(&mut self) -> Option<(String, bool)> {
         self.bump();
         let first = self.bump()?;
         if !first.is_ascii_alphabetic() {
-            return control_symbol(first).map(str::to_string);
+            return control_symbol(first).map(|symbol| (symbol.to_string(), false));
         }
 
         let start = self.offset - first.len_utf8();
@@ -85,33 +114,35 @@ impl<'a> Parser<'a> {
         }
         let command = &self.source[start..self.offset];
         if matches!(command, "left" | "right") {
-            return Some(String::new());
+            return Some((String::new(), false));
         }
         if matches!(
             command,
             "mathbf" | "mathrm" | "mathit" | "mathsf" | "mathtt" | "boldsymbol"
         ) {
-            return self.required_group();
+            return Some((self.required_group()?, false));
         }
         if command == "mathbb" {
             let content = self.required_group()?;
-            return mathbb(&content).map(str::to_string);
+            return mathbb(&content).map(|symbol| (symbol.to_string(), false));
+        }
+        if matches!(command, "frac" | "tfrac") {
+            let numerator = self.numeric_argument()?;
+            let denominator = self.numeric_argument()?;
+            return vulgar_fraction(&numerator, &denominator)
+                .map(|fraction| (fraction.to_string(), false));
         }
         if command == "text" {
-            return self.text_group();
+            return Some((self.text_group()?, false));
         }
         if command == "operatorname" {
             let operator = self.text_group()?;
-            return Some(format!("{operator} "));
+            return Some((operator, true));
         }
         if let Some(function) = named_function(command) {
-            let separator = self.source[self.offset..]
-                .chars()
-                .find(|character| !character.is_whitespace())
-                .is_some_and(|character| !matches!(character, '(' | '['));
-            return Some(format!("{function}{}", if separator { " " } else { "" }));
+            return Some((function.to_string(), true));
         }
-        symbol(command).map(str::to_string)
+        symbol(command).map(|symbol| (symbol.to_string(), false))
     }
 
     fn required_group(&mut self) -> Option<String> {
@@ -119,6 +150,19 @@ impl<'a> Parser<'a> {
             return None;
         }
         self.sequence(Some('}'))
+    }
+
+    fn numeric_argument(&mut self) -> Option<String> {
+        while self.peek().is_some_and(char::is_whitespace) {
+            self.bump();
+        }
+        let argument = if self.peek() == Some('{') {
+            self.required_group()?
+        } else {
+            self.bump()?.to_string()
+        };
+        (!argument.is_empty() && argument.bytes().all(|byte| byte.is_ascii_digit()))
+            .then_some(argument)
     }
 
     fn text_group(&mut self) -> Option<String> {
@@ -166,6 +210,34 @@ impl<'a> Parser<'a> {
         let character = self.peek()?;
         self.offset += character.len_utf8();
         Some(character)
+    }
+}
+
+fn needs_space_before_named_function(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, ')' | ']' | '}' | '′' | '″' | '‴')
+}
+
+fn vulgar_fraction(numerator: &str, denominator: &str) -> Option<char> {
+    match (numerator, denominator) {
+        ("1", "2") => Some('½'),
+        ("1", "3") => Some('⅓'),
+        ("2", "3") => Some('⅔'),
+        ("1", "4") => Some('¼'),
+        ("3", "4") => Some('¾'),
+        ("1", "5") => Some('⅕'),
+        ("2", "5") => Some('⅖'),
+        ("3", "5") => Some('⅗'),
+        ("4", "5") => Some('⅘'),
+        ("1", "6") => Some('⅙'),
+        ("5", "6") => Some('⅚'),
+        ("1", "7") => Some('⅐'),
+        ("1", "8") => Some('⅛'),
+        ("3", "8") => Some('⅜'),
+        ("5", "8") => Some('⅝'),
+        ("7", "8") => Some('⅞'),
+        ("1", "9") => Some('⅑'),
+        ("1", "10") => Some('⅒'),
+        _ => None,
     }
 }
 

@@ -581,7 +581,7 @@ async fn display_math_inside_blockquote_keeps_quote_layout() {
 
 #[tokio::test]
 async fn simple_inline_math_uses_unicode_without_scheduling_an_image() {
-    let source = r"Given \(x\in\ker f''\), continue.";
+    let source = r"We have \(2ab\cos C\), \(\sin^2 x+\cos^2 x=1\), and \(K=\frac12mv^2\).";
     let (renderer, event_rx) =
         start_test_renderer(immediate_render(), test_limits(/*cache_entry_capacity*/ 2));
     let cell = AgentMarkdownCell::new(source.to_string(), std::path::Path::new("/tmp"))
@@ -591,8 +591,8 @@ async fn simple_inline_math_uses_unicode_without_scheduling_an_image() {
     assert!(rendered.iter().all(|line| line.kitty_images.is_empty()));
     assert!(event_rx.is_empty());
     assert_eq!(
-        image_snapshot(&cell.transcript_hyperlink_lines(/*width*/ 48)),
-        r"• Given \(x\in\ker f''\), continue.",
+        image_snapshot(&cell.transcript_hyperlink_lines(/*width*/ 120)),
+        r"• We have \(2ab\cos C\), \(\sin^2 x+\cos^2 x=1\), and \(K=\frac12mv^2\).",
     );
     assert_snapshot!("inline_math_agent_cell_ready", image_snapshot(&rendered),);
 }
