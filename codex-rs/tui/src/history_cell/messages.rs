@@ -363,13 +363,15 @@ impl HistoryCell for AgentMessageCell {
 /// session that produced the message. Reusing the current process cwd during reflow would make old
 /// transcript content change meaning after a later `/cd` or resumed session.
 ///
-/// Ordinary markdown caches its latest rich render. Visualization directives bypass that cache
-/// because resolving their local file links depends on filesystem state that can change later.
+/// Ordinary markdown caches its latest render. Visualization directives bypass the cache because
+/// their external state can change after the cell is constructed. Rendered LaTeX bypasses the cache
+/// for display only; the literal transcript still shares the ordinary cache.
 #[derive(Debug)]
 pub(crate) struct AgentMarkdownCell {
     markdown_source: String,
     cwd: PathBuf,
     inline_visualization_context: Option<crate::inline_visualization::InlineVisualizationContext>,
+    latex_renderer: Option<crate::latex_renderer::LatexRenderHandle>,
     rendered_lines: Option<MarkdownRenderCache>,
 }
 
@@ -395,15 +397,53 @@ impl AgentMarkdownCell {
             crate::inline_visualization::InlineVisualizationContext,
         >,
     ) -> Self {
-        let rendered_lines = (!markdown_source
-            .contains(crate::inline_visualization::DIRECTIVE_PREFIX))
-        .then(MarkdownRenderCache::default);
+        let cacheable = !markdown_source.contains(crate::inline_visualization::DIRECTIVE_PREFIX);
         Self {
             markdown_source,
             cwd: cwd.to_path_buf(),
             inline_visualization_context,
-            rendered_lines,
+            latex_renderer: None,
+            rendered_lines: cacheable.then(MarkdownRenderCache::default),
         }
+    }
+
+    pub(crate) fn with_latex_renderer(
+        mut self,
+        renderer: crate::latex_renderer::LatexRenderHandle,
+    ) -> Self {
+        self.latex_renderer = Some(renderer);
+        self
+    }
+
+    fn render_markdown(
+        &self,
+        width: u16,
+        latex_renderer: Option<&crate::latex_renderer::LatexRenderHandle>,
+    ) -> Vec<HyperlinkLine> {
+        let Some(wrap_width) =
+            crate::width::usable_content_width_u16(width, /*reserved_cols*/ 2)
+        else {
+            return prefix_hyperlink_lines(
+                vec![HyperlinkLine::new(Line::default())],
+                "• ".dim(),
+                "  ".into(),
+            );
+        };
+
+        let lines = crate::markdown::render_markdown_agent_with_options(
+            &self.markdown_source,
+            crate::markdown::AgentMarkdownRenderOptions {
+                width: Some(wrap_width),
+                cwd: Some(self.cwd.as_path()),
+                inline_visualization_context: self.inline_visualization_context.as_ref(),
+                latex_renderer,
+            },
+        );
+        normalize_whitespace_only_hyperlink_lines(prefix_hyperlink_lines(
+            lines,
+            "• ".dim(),
+            "  ".into(),
+        ))
     }
 }
 
@@ -428,33 +468,13 @@ impl HistoryCell for AgentMarkdownCell {
     }
 
     fn display_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
-        let render = || {
-            let Some(wrap_width) =
-                crate::width::usable_content_width_u16(width, /*reserved_cols*/ 2)
-            else {
-                return prefix_hyperlink_lines(
-                    vec![HyperlinkLine::new(Line::default())],
-                    "• ".dim(),
-                    "  ".into(),
-                );
-            };
+        let render = || self.render_markdown(width, self.latex_renderer.as_ref());
 
-            // Re-render markdown from source at the current width. Reserve 2 columns for the "• " /
-            // " " prefix prepended below.
-            let lines = crate::markdown::render_markdown_agent_with_links_cwd_and_visualizations(
-                &self.markdown_source,
-                Some(wrap_width),
-                Some(self.cwd.as_path()),
-                self.inline_visualization_context.as_ref(),
-            );
-            normalize_whitespace_only_hyperlink_lines(prefix_hyperlink_lines(
-                lines,
-                "• ".dim(),
-                "  ".into(),
-            ))
-        };
-
-        if let Some(rendered_lines) = &self.rendered_lines {
+        if self.latex_renderer.is_some() {
+            // Display-math lines can own PNG Arcs. Keep those exclusively in the bounded renderer
+            // cache instead of retaining an additional copy for every historical message.
+            render()
+        } else if let Some(rendered_lines) = &self.rendered_lines {
             rendered_lines.render(width, render)
         } else {
             render()
@@ -462,7 +482,14 @@ impl HistoryCell for AgentMarkdownCell {
     }
 
     fn transcript_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
-        self.display_hyperlink_lines(width)
+        // Kitty placeholders are deliberately omitted from Ctrl+T so selection remains copyable
+        // and the pager never depends on scrollback-only image transmission hooks.
+        let render = || self.render_markdown(width, /*latex_renderer*/ None);
+        if let Some(rendered_lines) = &self.rendered_lines {
+            rendered_lines.render(width, render)
+        } else {
+            render()
+        }
     }
 
     fn raw_lines(&self) -> Vec<Line<'static>> {
@@ -553,7 +580,11 @@ pub(crate) fn new_reasoning_summary_block(
     cwd: &Path,
 ) -> Box<dyn HistoryCell> {
     let (header, content) = split_reasoning_summary_parts(&reasoning_parts);
-    let transcript_only = header.is_empty();
+    let title_only = content
+        .strip_prefix("**")
+        .and_then(|content| content.strip_suffix("**"))
+        .is_some_and(|content| !content.is_empty() && !content.contains("**"));
+    let transcript_only = header.is_empty() && !title_only;
     Box::new(ReasoningSummaryCell::new(
         header,
         content,

@@ -32,6 +32,159 @@ fn plain_lines(text: &Text<'_>) -> Vec<String> {
 }
 
 #[test]
+fn standalone_display_math_literal_fallback_snapshot() {
+    let rendered = render_markdown_text(
+        "Before.\n\n\\[\n  \\text{fluid acceleration}\n\n=\n\\text{pressure forces}\n+\\text{viscous forces}\n\\]\n\nAfter.",
+    );
+
+    assert_snapshot!(plain_lines(&rendered).join("\n"), @r"
+    Before.
+
+    \[
+      \text{fluid acceleration}
+
+    =
+    \text{pressure forces}
+    +\text{viscous forces}
+    \]
+
+    After.
+    ");
+}
+
+#[test]
+fn display_math_does_not_consume_its_paragraph_events() {
+    let source = "Before.\n\\[\nx\n\\]\nAfter.";
+    let rendered = render_markdown_text(source);
+
+    assert_eq!(
+        plain_lines(&rendered),
+        vec!["Before.", "\\[", "x", "\\]", "After."]
+    );
+}
+
+#[test]
+fn explicit_inline_math_literal_fallback_preserves_source_and_tex_punctuation() {
+    let source =
+        r"Given \(x\in\ker f''\), compare \(\mathbf{x} * [y](z)\), but leave $HOME alone.";
+    let rendered = render_markdown_text_with_width(source, /*width*/ Some(80));
+
+    assert_eq!(plain_lines(&rendered), vec![source]);
+    assert!(
+        rendered
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .all(|span| !span.style.add_modifier.contains(Modifier::ITALIC))
+    );
+}
+
+#[test]
+fn inline_math_mask_does_not_conflict_with_decoded_entities() {
+    let source = "&#65; \\(x\\)";
+    let rendered = render_markdown_text_with_width(source, /*width*/ None);
+
+    assert_eq!(plain_lines(&rendered), vec!["A \\(x\\)"]);
+}
+
+#[test]
+fn math_delimiters_in_an_autolink_do_not_change_its_destination() {
+    let destination = r"https://example.com/\(path\)";
+    let source = format!("<{destination}>");
+    let lines = render_markdown_lines_with_width_and_cwd(
+        &source,
+        /*width*/ Some(80),
+        /*cwd*/ None,
+    );
+    let rendered = lines
+        .iter()
+        .map(|line| {
+            let text = line
+                .line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            let hyperlinks = line
+                .hyperlinks
+                .iter()
+                .map(|link| (link.columns.clone(), link.destination.as_str()))
+                .collect::<Vec<_>>();
+            (text, hyperlinks)
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        rendered,
+        vec![(
+            format!("{destination} ({destination})"),
+            vec![
+                (0..destination.len(), destination),
+                (
+                    destination.len() + 2..destination.len() * 2 + 2,
+                    destination,
+                ),
+            ],
+        )],
+    );
+}
+
+#[test]
+fn math_masks_do_not_change_opaque_markdown_structure() {
+    for source in [
+        r"<\(x\)>",
+        r"<\(x\):y>",
+        r"<\(x\)@example.com>",
+        r"<foo@\(x y\).com>",
+        "[\\(x\\)]\n\n[aaaaa]: https://example.com",
+        "ABCDEFGHIJKLMNOPQR\n[\\(x\\)]\n\n[ſſſſſ]: /url",
+    ] {
+        let lines = render_markdown_lines_with_width_and_cwd(
+            source,
+            /*width*/ Some(80),
+            /*cwd*/ None,
+        );
+        assert_eq!(
+            (
+                lines
+                    .iter()
+                    .map(|line| line.line.to_string())
+                    .collect::<Vec<_>>(),
+                lines
+                    .iter()
+                    .flat_map(|line| &line.hyperlinks)
+                    .count(),
+            ),
+            (
+                source.lines().map(str::to_string).collect::<Vec<_>>(),
+                0,
+            ),
+            "{source:?}",
+        );
+    }
+}
+
+#[test]
+fn inline_math_literal_fallback_preserves_code_links_and_tables() {
+    let source = "`\\(code\\)`\n\n[\\(linked\\)](https://example.com)\n\n| Math |\n| --- |\n| \\(table\\) |";
+    let rendered = plain_lines(&render_markdown_text_with_width(
+        source,
+        /*width*/ Some(80),
+    ))
+    .join("\n");
+
+    assert!(rendered.contains(r"\(code\)"));
+    assert!(rendered.contains(r"\(linked\)"));
+    assert!(rendered.contains(r"\(table\)"));
+    assert!(!rendered.chars().any(|character| {
+        matches!(
+            character,
+            '\u{001c}' | '\u{001d}' | '\u{001e}' | '\u{001f}'
+        )
+    }));
+}
+
+#[test]
 fn bare_url_with_tilde_keeps_complete_hyperlink() {
     let destination =
         "https://www.cs.tufts.edu/~nr/cs257/archive/olin-shivers/dissertation.pdf";
@@ -1722,6 +1875,24 @@ fn table_renders_key_value_records_when_compact_fragmentation_is_systemic_snapsh
     let text = render_markdown_text_with_width(md, Some(/*width*/ 17));
 
     assert_snapshot!(plain_lines(&text).join("\n"));
+}
+
+#[test]
+fn table_renders_halfwidth_sound_marks_at_constrained_width_snapshot() {
+    let md = r#"| Key | Notes |
+| --- | --- |
+| ｶﾞﾊﾟtail | First ｶﾞ row with an escaped \| pipe. |
+| ﾊﾟｶﾞtail | Second ﾊﾟ row with an escaped \| pipe. |
+| short | Final ｶﾞﾊﾟ row. |
+"#;
+    let grid = render_markdown_text_with_width(md, Some(/*width*/ 23));
+    let records = render_markdown_text_with_width(md, Some(/*width*/ 17));
+
+    assert_snapshot!(format!(
+        "grid (23 cells):\n{}\n\nrecords (17 cells):\n{}",
+        plain_lines(&grid).join("\n"),
+        plain_lines(&records).join("\n")
+    ));
 }
 
 #[test]

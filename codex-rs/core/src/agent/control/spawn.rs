@@ -655,7 +655,7 @@ impl AgentControl {
             .unwrap_or_default();
         if let SpawnAgentForkMode::LastNTurns(last_n_turns) = fork_mode {
             forked_rollout_items =
-                truncate_rollout_to_last_n_fork_turns(&forked_rollout_items, *last_n_turns);
+                truncate_rollout_to_last_n_fork_turns(forked_rollout_items, *last_n_turns);
         }
         let multi_agent_v2_usage_hint_texts_to_filter: Vec<String> =
             if multi_agent_version == MultiAgentVersion::V2 {
@@ -696,6 +696,9 @@ impl AgentControl {
         // Compaction stores response items separately, so sanitize both top-level messages and
         // compacted replacement histories with the same policy.
         let retain_forked_item = |response_item: &mut ResponseItem, replaced: &mut bool| {
+            if matches!(response_item, ResponseItem::AgentMessage { .. }) {
+                return false;
+            }
             if is_multi_agent_v2_usage_hint_message(
                 response_item,
                 &multi_agent_v2_usage_hint_texts_to_filter,

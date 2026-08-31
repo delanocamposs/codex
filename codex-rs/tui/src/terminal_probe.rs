@@ -14,6 +14,9 @@
 
 use std::time::Duration;
 
+#[cfg(unix)]
+mod kitty;
+
 /// Default wall-clock budget for each startup probe group.
 pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -30,6 +33,7 @@ pub(crate) struct DefaultColors {
 #[cfg_attr(test, allow(dead_code))]
 mod imp {
     use super::DefaultColors;
+    use super::kitty;
     use super::parse_default_colors;
     use std::fs::File;
     use std::fs::OpenOptions;
@@ -43,12 +47,15 @@ mod imp {
     use crossterm::event::KeyboardEnhancementFlags;
     use ratatui::layout::Position;
 
+    use crate::terminal_graphics::KittyGraphicsTerminal;
+
     /// Results from the TUI's one-shot startup terminal probe.
     #[derive(Debug, Clone, Copy, Eq, PartialEq)]
     pub(crate) struct StartupProbe {
         pub(crate) cursor_position: Option<Position>,
         pub(crate) default_colors: Option<DefaultColors>,
         pub(crate) keyboard_enhancement_supported: Option<bool>,
+        pub(crate) kitty_graphics_terminal: Option<KittyGraphicsTerminal>,
     }
 
     /// Whether the startup probe should query keyboard enhancement support.
@@ -251,16 +258,19 @@ mod imp {
         timeout: Duration,
         keyboard_probe: StartupKeyboardEnhancementProbe,
     ) -> io::Result<StartupProbe> {
+        let kitty_graphics_probe = kitty::startup_version_probe();
         let mut tty = Tty::open()?;
+        let mut query = kitty_graphics_probe.query_bytes().to_vec();
         match keyboard_probe {
             StartupKeyboardEnhancementProbe::Query => {
-                tty.write_all(b"\x1B[6n\x1B]10;?\x1B\\\x1B]11;?\x1B\\\x1B[?u\x1B[c")?;
+                query.extend_from_slice(b"\x1B[6n\x1B]10;?\x1B\\\x1B]11;?\x1B\\\x1B[?u\x1B[c");
             }
             StartupKeyboardEnhancementProbe::Skip => {
-                tty.write_all(b"\x1B[6n\x1B]10;?\x1B\\\x1B]11;?\x1B\\")?;
+                query.extend_from_slice(b"\x1B[6n\x1B]10;?\x1B\\\x1B]11;?\x1B\\");
             }
         }
-        read_startup_probe(&mut tty, timeout, keyboard_probe)
+        tty.write_all(&query)?;
+        read_startup_probe(&mut tty, timeout, keyboard_probe, kitty_graphics_probe)
     }
 
     /// Reads available terminal bytes until `parse` recognizes a probe response or time expires.
@@ -294,6 +304,7 @@ mod imp {
         tty: &mut Tty,
         timeout: Duration,
         keyboard_probe: StartupKeyboardEnhancementProbe,
+        mut kitty_graphics_probe: kitty::StartupVersionProbe,
     ) -> io::Result<StartupProbe> {
         let deadline = Instant::now() + timeout;
         let mut buffer = Vec::new();
@@ -301,6 +312,7 @@ mod imp {
             cursor_position: None,
             default_colors: None,
             keyboard_enhancement_supported: None,
+            kitty_graphics_terminal: None,
         };
         let mut saw_supported_keyboard = false;
         loop {
@@ -311,7 +323,10 @@ mod imp {
                 &buffer,
                 keyboard_probe,
             );
-            if startup_probe_complete(&probe, keyboard_probe) {
+            kitty_graphics_probe.observe(&buffer);
+            probe.kitty_graphics_terminal = kitty_graphics_probe.terminal();
+            if startup_probe_complete(&probe, keyboard_probe) && kitty_graphics_probe.is_complete()
+            {
                 return Ok(probe);
             }
             let now = Instant::now();
@@ -478,7 +493,7 @@ mod imp {
         None
     }
 
-    fn find_all_subslices<'a>(
+    pub(super) fn find_all_subslices<'a>(
         haystack: &'a [u8],
         needle: &'a [u8],
     ) -> impl Iterator<Item = usize> + 'a {
@@ -492,6 +507,7 @@ mod imp {
     mod tests {
         use super::*;
         use pretty_assertions::assert_eq;
+        use std::thread;
 
         #[test]
         fn parses_cursor_position_as_zero_based() {
@@ -535,12 +551,14 @@ mod imp {
                 cursor_position: None,
                 default_colors: None,
                 keyboard_enhancement_supported: None,
+                kitty_graphics_terminal: None,
             };
             let mut saw_supported_keyboard = false;
             update_startup_probe(
                 &mut probe,
                 &mut saw_supported_keyboard,
-                b"\x1B[20;10R\x1B]11;rgb:1111/1111/1111\x07\x1B[?64;1;2c\x1B]10;rgb:eeee/eeee/eeee\x1B\\\x1B[?7u",
+                b"\x1B[20;10R\x1B]11;rgb:1111/1111/1111\x07\
+                  \x1B[?64;1;2c\x1B]10;rgb:eeee/eeee/eeee\x1B\\\x1B[?7u",
                 StartupKeyboardEnhancementProbe::Query,
             );
 
@@ -553,12 +571,84 @@ mod imp {
                         bg: (17, 17, 17),
                     }),
                     keyboard_enhancement_supported: Some(true),
+                    kitty_graphics_terminal: None,
                 }
             );
             assert!(startup_probe_complete(
                 &probe,
                 StartupKeyboardEnhancementProbe::Query
             ));
+        }
+
+        #[test]
+        fn startup_reader_waits_for_later_split_xtversion_reply() {
+            let cases = [
+                (
+                    b"\x1BP>|kitty(0.".as_slice(),
+                    b"48.1)\x1B\\".as_slice(),
+                    KittyGraphicsTerminal::Kitty {
+                        version: (0, 48, 1),
+                    },
+                ),
+                (
+                    b"\x1BP>|ghostty 1.3.".as_slice(),
+                    b"1-arch2\x1B\\".as_slice(),
+                    KittyGraphicsTerminal::Ghostty { version: (1, 3, 1) },
+                ),
+            ];
+
+            for (version_prefix, version_suffix, expected_terminal) in cases {
+                let mut descriptors = [-1; 2];
+                if unsafe { libc::pipe(descriptors.as_mut_ptr()) } == -1 {
+                    panic!("create terminal pipe: {}", io::Error::last_os_error());
+                }
+                // SAFETY: `pipe` initialized both descriptors above, and each is transferred to
+                // exactly one owning `File`.
+                let reader = unsafe { File::from_raw_fd(descriptors[0]) };
+                // SAFETY: See the ownership argument above for the pipe's write descriptor.
+                let mut replies = unsafe { File::from_raw_fd(descriptors[1]) };
+                replies
+                    .write_all(
+                        b"\x1B[20;10R\
+                          \x1B]10;rgb:eeee/eeee/eeee\x1B\\\
+                          \x1B]11;rgb:1111/1111/1111\x07",
+                    )
+                    .expect("write ordinary startup replies");
+                let writer = reader.try_clone().expect("clone terminal handle");
+                let mut tty = Tty::new(reader, writer).expect("create nonblocking terminal");
+                let response_thread = thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(10));
+                    replies
+                        .write_all(version_prefix)
+                        .expect("write split version prefix");
+                    thread::sleep(Duration::from_millis(10));
+                    replies
+                        .write_all(version_suffix)
+                        .expect("write split version suffix");
+                });
+
+                let probe = read_startup_probe(
+                    &mut tty,
+                    Duration::from_secs(1),
+                    StartupKeyboardEnhancementProbe::Skip,
+                    kitty::StartupVersionProbe::query(),
+                )
+                .expect("read startup probe");
+                response_thread.join().expect("join response writer");
+
+                assert_eq!(
+                    probe,
+                    StartupProbe {
+                        cursor_position: Some(Position { x: 9, y: 19 }),
+                        default_colors: Some(DefaultColors {
+                            fg: (238, 238, 238),
+                            bg: (17, 17, 17),
+                        }),
+                        keyboard_enhancement_supported: None,
+                        kitty_graphics_terminal: Some(expected_terminal),
+                    },
+                );
+            }
         }
     }
 }

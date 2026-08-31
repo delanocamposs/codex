@@ -122,14 +122,15 @@ impl App {
 
     /// Start retaining a thread-switch transcript replay without rendering each historical cell.
     ///
-    /// Thread switches already rebuild `transcript_cells` from source. When a row cap exists, we can
-    /// defer terminal writes until the replay is complete and reuse the resize-reflow tail renderer
-    /// so only the rows the terminal would retain are formatted and inserted.
+    /// Thread switches already rebuild `transcript_cells` from source. With a row cap, defer
+    /// terminal writes until replay is complete and reuse the resize-reflow tail renderer. Without
+    /// a cap, keep the lightweight buffer marker so an encountered math cell can switch the
+    /// remainder to tail-first rendering without delaying math-free transcripts.
     pub(super) fn begin_thread_switch_history_replay_buffer(&mut self) {
-        if self.resize_reflow_max_rows().is_some() && self.overlay.is_none() {
+        if self.overlay.is_none() {
             self.initial_history_replay_buffer = Some(InitialHistoryReplayBuffer {
                 retained_lines: VecDeque::new(),
-                render_from_transcript_tail: true,
+                render_from_transcript_tail: self.resize_reflow_max_rows().is_some(),
             });
         }
     }
@@ -219,6 +220,25 @@ impl App {
         while buffer.retained_lines.len() > max_rows {
             buffer.retained_lines.pop_front();
         }
+    }
+
+    /// Rebuild finalized scrollback after an asynchronous display-math render becomes available.
+    ///
+    /// A normal frame redraw cannot replace rows already committed to terminal scrollback. Route
+    /// the update through the existing source-backed reflow path, and coalesce formulas that finish
+    /// close together. Results from a cleared or replaced transcript generation are ignored.
+    pub(super) fn schedule_latex_reflow(&mut self, tui: &mut tui::Tui, generation: u64) {
+        let Some(renderer) = self.latex_renderer.as_ref() else {
+            return;
+        };
+        if renderer.generation() != generation {
+            return;
+        }
+
+        self.transcript_reflow
+            .schedule_debounced(/*target_width*/ None);
+        tui.frame_requester()
+            .schedule_frame_in(TRANSCRIPT_REFLOW_DEBOUNCE);
     }
 
     fn schedule_resize_reflow(&mut self, target_width: Option<u16>) -> bool {

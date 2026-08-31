@@ -1,5 +1,6 @@
 use std::fmt;
 use std::future::Future;
+use std::io;
 use std::io::IsTerminal;
 use std::io::Result;
 use std::io::Stdout;
@@ -22,8 +23,6 @@ use crossterm::event::EnableBracketedPaste;
 #[cfg(not(windows))]
 use crossterm::event::EnableFocusChange;
 use crossterm::event::KeyEvent;
-use crossterm::terminal::EnterAlternateScreen;
-use crossterm::terminal::LeaveAlternateScreen;
 #[cfg(not(unix))]
 use crossterm::terminal::supports_keyboard_enhancement;
 use ratatui::backend::Backend;
@@ -439,6 +438,7 @@ pub(crate) fn init() -> Result<InitializedTerminal> {
                     cursor_position = probe.cursor_position.is_some(),
                     default_colors = probe.default_colors.is_some(),
                     keyboard_enhancement_supported = ?probe.keyboard_enhancement_supported,
+                    kitty_graphics_terminal = ?probe.kitty_graphics_terminal,
                     "terminal startup probes completed"
                 );
                 probe
@@ -452,6 +452,7 @@ pub(crate) fn init() -> Result<InitializedTerminal> {
                     cursor_position: None,
                     default_colors: None,
                     keyboard_enhancement_supported: None,
+                    kitty_graphics_terminal: None,
                 }
             }
         }
@@ -459,6 +460,10 @@ pub(crate) fn init() -> Result<InitializedTerminal> {
 
     #[cfg(unix)]
     crate::terminal_palette::set_default_colors_from_startup_probe(startup_probe.default_colors);
+    #[cfg(unix)]
+    crate::terminal_graphics::set_kitty_graphics_terminal_from_startup_probe(
+        startup_probe.kitty_graphics_terminal,
+    );
 
     #[cfg(unix)]
     let cursor_pos = match startup_probe.cursor_position {
@@ -589,7 +594,7 @@ struct PendingHistoryLines {
 
 fn clear_for_viewport_change<B>(terminal: &mut CustomTerminal<B>, new_area: Rect) -> Result<()>
 where
-    B: Backend + Write,
+    B: Backend<Error = io::Error> + Write,
 {
     let clear_position = if terminal.viewport_area.is_empty() {
         new_area.as_position()
@@ -766,10 +771,10 @@ impl Tui {
     /// Enter alternate screen and expand the viewport to full terminal size, saving the current
     /// inline viewport for restoration when leaving.
     pub fn enter_alt_screen(&mut self) -> Result<()> {
-        if !self.alt_screen_enabled {
+        if !self.alt_screen_enabled || self.is_alt_screen_active() {
             return Ok(());
         }
-        let _ = execute!(self.terminal.backend_mut(), EnterAlternateScreen);
+        self.terminal.enter_alternate_screen()?;
         // Enable "alternate scroll" so terminals may translate wheel to arrows
         let _ = execute!(self.terminal.backend_mut(), EnableAlternateScroll);
         if let Ok(size) = self.terminal.size() {
@@ -788,12 +793,12 @@ impl Tui {
 
     /// Leave alternate screen and restore the previously saved inline viewport, if any.
     pub fn leave_alt_screen(&mut self) -> Result<()> {
-        if !self.alt_screen_enabled {
+        if !self.alt_screen_enabled || !self.is_alt_screen_active() {
             return Ok(());
         }
         // Disable alternate scroll when leaving alt-screen
         let _ = execute!(self.terminal.backend_mut(), DisableAlternateScroll);
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        self.terminal.leave_alternate_screen()?;
         if let Some(saved) = self.alt_saved_viewport.take() {
             self.terminal.set_viewport_area(saved);
         }

@@ -120,6 +120,7 @@ fn spawn_agent_call(call_id: &str) -> ResponseItem {
         namespace: None,
         arguments: "{}".to_string(),
         call_id: call_id.to_string(),
+        encrypted_function_args: None,
         internal_chat_message_metadata_passthrough: None,
     }
 }
@@ -1552,6 +1553,13 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
     let parent_thread = new_thread.thread;
     let turn_context = parent_thread.session.new_default_turn().await;
     let parent_spawn_call_id = "spawn-call-compacted-usage-hints".to_string();
+    let parent_task = InterAgentCommunication::new(
+        AgentPath::root(),
+        AgentPath::root().join("worker").expect("valid worker path"),
+        Vec::new(),
+        "compacted parent delegated task".to_string(),
+        /*trigger_turn*/ true,
+    );
     let replacement_history = vec![
         ResponseItem::Message {
             id: None,
@@ -1562,6 +1570,7 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         },
+        parent_task.to_model_input_item(),
         ResponseItem::Message {
             id: None,
             role: "developer".to_string(),
@@ -1640,6 +1649,13 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
     assert!(
         history_contains_text(history.raw_items(), "compacted parent summary"),
         "forked child history should retain compacted non-hint content"
+    );
+    assert!(
+        !history
+            .raw_items()
+            .iter()
+            .any(|item| matches!(item, ResponseItem::AgentMessage { .. })),
+        "forked child history should not inherit compacted parent agent messages"
     );
     assert!(
         !history_contains_text(history.raw_items(), "Parent root guidance."),

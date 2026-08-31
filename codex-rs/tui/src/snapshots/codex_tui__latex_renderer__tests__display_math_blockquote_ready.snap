@@ -1,0 +1,20 @@
+---
+source: tui/src/latex_renderer_tests.rs
+expression: snapshot
+---
+[literal fallback]
+• > Before
+  >
+  > \[
+  > x^2
+  > \]
+  >
+  > After
+
+[ready]
+• > Before
+  >
+  > ▧▧▧▧▧▧▧▧▧▧ [Kitty image]
+  > ▧▧▧▧▧▧▧▧▧▧ [Kitty image]
+  >
+  > After

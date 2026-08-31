@@ -287,8 +287,10 @@ pub(crate) enum AppEvent {
     /// Permanently delete the current active main thread and exit after it succeeds.
     DeleteCurrentThread,
 
-    /// Fork the current session into a new thread.
-    ForkCurrentSession,
+    /// Fork the current session into a new thread, optionally assigning it a name.
+    ForkCurrentSession {
+        name: Option<String>,
+    },
 
     /// Branch before a selected prompt and reopen it in the new thread's composer.
     ForkSessionForPromptEdit {
@@ -731,6 +733,14 @@ pub(crate) enum AppEvent {
 
     /// Finish buffering initial resume replay after all replay events have been queued.
     EndInitialHistoryReplayBuffer,
+
+    /// Background display-math state changed for the active transcript generation.
+    ///
+    /// Formula and PNG state stays in the renderer-owned cache. This event asks the app to rebuild
+    /// source-backed scrollback after an image completes or bounded queue pressure clears.
+    LatexRenderUpdated {
+        generation: u64,
+    },
 
     /// Replace the contiguous run of streaming `AgentMessageCell`s at the end of
     /// the transcript with a single `AgentMarkdownCell` that stores the raw

@@ -20,14 +20,20 @@
 //! info string is `md` or `markdown` AND whose body contains a
 //! header+delimiter pair, and degrades gracefully on unclosed fences.
 use ratatui::text::Line;
-use std::borrow::Cow;
 use std::ops::Range;
 use std::path::Path;
 
 use crate::inline_visualization::InlineVisualizationContext;
+use crate::inline_visualization::InlineVisualizationRewrite;
+use crate::inline_visualization::TrustedFileLink;
 use crate::inline_visualization::rewrite_inline_visualizations;
+use crate::math_source::PreparedMath;
+use crate::math_source::SourceEdit;
 use crate::table_detect;
 use crate::terminal_hyperlinks::HyperlinkLine;
+#[cfg(test)]
+use std::borrow::Cow;
+use std::collections::HashMap;
 
 /// Render markdown source to styled ratatui lines and append them to `lines`.
 ///
@@ -59,13 +65,18 @@ pub(crate) fn append_markdown_agent(
     width: Option<usize>,
     lines: &mut Vec<Line<'static>>,
 ) {
-    let normalized = unwrap_markdown_fences(markdown_source);
-    let rendered = crate::markdown_render::render_markdown_text_with_width_and_cwd(
-        &normalized,
-        width,
-        /*cwd*/ None,
+    let normalized =
+        normalize_agent_markdown(markdown_source, /*inline_visualization_context*/ None);
+    let rendered = crate::markdown_render::render_prepared_markdown_lines(
+        normalized.prepared_math,
+        crate::markdown_render::MarkdownRenderOptions {
+            width,
+            cwd: None,
+            is_hidden_link_destination: &|_| false,
+            latex_renderer: None,
+        },
     );
-    crate::render::line_utils::push_owned_lines(&rendered.lines, lines);
+    lines.extend(rendered.into_iter().map(|line| line.line));
 }
 
 pub(crate) fn render_markdown_agent_with_links_and_cwd(
@@ -73,11 +84,14 @@ pub(crate) fn render_markdown_agent_with_links_and_cwd(
     width: Option<usize>,
     cwd: Option<&Path>,
 ) -> Vec<HyperlinkLine> {
-    render_markdown_agent_with_links_cwd_and_visualizations(
+    render_markdown_agent_with_options(
         markdown_source,
-        width,
-        cwd,
-        /*inline_visualization_context*/ None,
+        AgentMarkdownRenderOptions {
+            width,
+            cwd,
+            inline_visualization_context: None,
+            latex_renderer: None,
+        },
     )
 }
 
@@ -87,23 +101,82 @@ pub(crate) fn render_markdown_agent_with_links_cwd_and_visualizations(
     cwd: Option<&Path>,
     inline_visualization_context: Option<&InlineVisualizationContext>,
 ) -> Vec<HyperlinkLine> {
-    let rewritten = rewrite_inline_visualizations(markdown_source, inline_visualization_context);
-    let normalized = unwrap_markdown_fences(&rewritten.markdown);
-    let is_hidden_link_destination =
-        |destination: &str| rewritten.trusted_file_links.contains_key(destination);
-    let mut lines =
-        crate::markdown_render::render_markdown_lines_with_width_cwd_and_hidden_link_destinations(
-            &normalized,
+    render_markdown_agent_with_options(
+        markdown_source,
+        AgentMarkdownRenderOptions {
             width,
             cwd,
-            &is_hidden_link_destination,
-        );
+            inline_visualization_context,
+            latex_renderer: None,
+        },
+    )
+}
+
+pub(crate) struct AgentMarkdownRenderOptions<'a> {
+    pub(crate) width: Option<usize>,
+    pub(crate) cwd: Option<&'a Path>,
+    pub(crate) inline_visualization_context: Option<&'a InlineVisualizationContext>,
+    pub(crate) latex_renderer: Option<&'a crate::latex_renderer::LatexRenderHandle>,
+}
+
+pub(crate) fn render_markdown_agent_with_options(
+    markdown_source: &str,
+    render_options: AgentMarkdownRenderOptions<'_>,
+) -> Vec<HyperlinkLine> {
+    let AgentMarkdownRenderOptions {
+        width,
+        cwd,
+        inline_visualization_context,
+        latex_renderer,
+    } = render_options;
+    let normalized = normalize_agent_markdown(markdown_source, inline_visualization_context);
+    let is_hidden_link_destination =
+        |destination: &str| normalized.trusted_file_links.contains_key(destination);
+    let mut lines = crate::markdown_render::render_prepared_markdown_lines(
+        normalized.prepared_math,
+        crate::markdown_render::MarkdownRenderOptions {
+            width,
+            cwd,
+            is_hidden_link_destination: &is_hidden_link_destination,
+            latex_renderer,
+        },
+    );
     for hyperlink in lines.iter_mut().flat_map(|line| &mut line.hyperlinks) {
-        if let Some(link) = rewritten.trusted_file_links.get(&hyperlink.destination) {
+        if let Some(link) = normalized.trusted_file_links.get(&hyperlink.destination) {
             hyperlink.retarget_to_trusted_file(&link.destination);
         }
     }
     lines
+}
+
+fn normalize_agent_markdown<'a>(
+    markdown_source: &'a str,
+    inline_visualization_context: Option<&InlineVisualizationContext>,
+) -> NormalizedAgentMarkdown<'a> {
+    let mut prepared_math = PreparedMath::new(markdown_source);
+    let InlineVisualizationRewrite {
+        markdown: _,
+        source_edits,
+        trusted_file_links,
+    } = rewrite_inline_visualizations(prepared_math.markdown(), inline_visualization_context);
+    prepared_math = prepared_math.apply_edits(&source_edits);
+    let MarkdownFenceRewrite {
+        markdown,
+        source_edits,
+    } = unwrap_markdown_fences_with_edits(prepared_math.markdown());
+    prepared_math = prepared_math.apply_edits(&source_edits);
+    if let Some(markdown) = markdown {
+        debug_assert_eq!(prepared_math.markdown(), markdown);
+    }
+    NormalizedAgentMarkdown {
+        prepared_math,
+        trusted_file_links,
+    }
+}
+
+struct NormalizedAgentMarkdown<'a> {
+    prepared_math: PreparedMath<'a>,
+    trusted_file_links: HashMap<String, TrustedFileLink>,
 }
 
 /// Render an agent message and collect the block metadata needed for incremental rendering.
@@ -116,19 +189,30 @@ pub(crate) fn render_streaming_markdown_agent_with_links_and_cwd(
     width: Option<usize>,
     cwd: Option<&Path>,
 ) -> crate::markdown_render::StreamingMarkdownRender {
-    let normalized = unwrap_markdown_fences(markdown_source);
-    let mut rendered = crate::markdown_render::render_streaming_markdown_lines_with_width_and_cwd(
-        &normalized,
-        width,
-        cwd,
-    );
-    if normalized != markdown_source {
+    let prepared_math = PreparedMath::new(markdown_source);
+    let MarkdownFenceRewrite {
+        markdown,
+        source_edits,
+    } = unwrap_markdown_fences_with_edits(prepared_math.markdown());
+    let prepared_math = prepared_math.apply_edits(&source_edits);
+    if let Some(markdown) = markdown {
+        debug_assert_eq!(prepared_math.markdown(), markdown);
+    }
+    let normalized_source =
+        (prepared_math.source() != markdown_source).then(|| prepared_math.source().to_string());
+    let mut rendered =
+        crate::markdown_render::render_prepared_streaming_markdown_lines_with_width_and_cwd(
+            prepared_math,
+            width,
+            cwd,
+        );
+    if let Some(normalized_source) = normalized_source {
         // Fence unwrapping removes opening/closing lines. A normalized tail that is still a raw
         // suffix necessarily begins after those removed lines, so its boundary can safely be
         // mapped back to the raw source; otherwise leave the transformed block mutable.
         rendered.last_top_level_block_start = rendered
             .last_top_level_block_start
-            .and_then(|boundary| markdown_source.strip_suffix(&normalized[boundary..]))
+            .and_then(|boundary| markdown_source.strip_suffix(&normalized_source[boundary..]))
             .map(str::len);
     }
     rendered
@@ -145,10 +229,25 @@ pub(crate) fn render_streaming_markdown_agent_with_links_and_cwd(
 /// The fence unwrapping is intentionally conservative: it buffers the entire fence body before
 /// deciding, and an unclosed fence at end-of-input is re-emitted with its opening line so partial
 /// streams degrade to code display.
+#[cfg(test)]
 fn unwrap_markdown_fences<'a>(markdown_source: &'a str) -> Cow<'a, str> {
+    unwrap_markdown_fences_with_edits(markdown_source)
+        .markdown
+        .map_or(Cow::Borrowed(markdown_source), Cow::Owned)
+}
+
+struct MarkdownFenceRewrite {
+    markdown: Option<String>,
+    source_edits: Vec<SourceEdit>,
+}
+
+fn unwrap_markdown_fences_with_edits(markdown_source: &str) -> MarkdownFenceRewrite {
     // Zero-copy fast path: most messages contain no fences at all.
     if !markdown_source.contains("```") && !markdown_source.contains("~~~") {
-        return Cow::Borrowed(markdown_source);
+        return MarkdownFenceRewrite {
+            markdown: None,
+            source_edits: Vec::new(),
+        };
     }
 
     #[derive(Clone, Copy)]
@@ -272,6 +371,7 @@ fn unwrap_markdown_fences<'a>(markdown_source: &'a str) -> Cow<'a, str> {
     }
 
     let mut out = String::with_capacity(markdown_source.len());
+    let mut source_edits = Vec::new();
     let mut active_fence: Option<ActiveFence> = None;
     let mut source_offset = 0usize;
 
@@ -300,9 +400,17 @@ fn unwrap_markdown_fences<'a>(markdown_source: &'a str) -> Cow<'a, str> {
                             &content_from_ranges(markdown_source, &data.content_ranges),
                             data.fence.is_blockquoted,
                         ) {
+                            source_edits.push(SourceEdit {
+                                range: data.opening_range,
+                                replacement: String::new(),
+                            });
                             for range in data.content_ranges {
                                 push_source_range(range);
                             }
+                            source_edits.push(SourceEdit {
+                                range: line_range,
+                                replacement: String::new(),
+                            });
                         } else {
                             push_source_range(data.opening_range);
                             for range in data.content_ranges {
@@ -350,7 +458,10 @@ fn unwrap_markdown_fences<'a>(markdown_source: &'a str) -> Cow<'a, str> {
         }
     }
 
-    Cow::Owned(out)
+    MarkdownFenceRewrite {
+        markdown: Some(out),
+        source_edits,
+    }
 }
 
 #[cfg(test)]
@@ -461,6 +572,87 @@ mod tests {
         let rendered = lines_to_strings(&out);
         assert!(rendered.iter().any(|line| line.contains('━')));
         assert!(rendered.iter().any(|line| line.contains(" 1      2")));
+    }
+
+    #[test]
+    fn unwrapped_code_does_not_become_math() {
+        let src = "```markdown\n| A | B |\n|---|---|\n\\(code-owned\\)\n```\n";
+        let normalized = normalize_agent_markdown(src, /*inline_visualization_context*/ None);
+
+        assert!(!normalized.prepared_math.has_math());
+        assert_eq!(
+            normalized.prepared_math.source(),
+            "| A | B |\n|---|---|\n\\(code-owned\\)\n"
+        );
+    }
+
+    #[test]
+    fn accepted_math_owns_normalizer_syntax() {
+        let src = concat!(
+            "\\[\n",
+            "```markdown\n",
+            "| A | B |\n",
+            "|---|---|\n",
+            "::codex-inline-vis{file=\"chart.html\"}\n",
+            "```\n",
+            "\\]\n",
+        );
+        let normalized = normalize_agent_markdown(src, /*inline_visualization_context*/ None);
+
+        assert!(normalized.prepared_math.has_math());
+        assert_eq!(normalized.prepared_math.source(), src);
+
+        let mut appended = Vec::new();
+        append_markdown_agent(src, /*width*/ None, &mut appended);
+        assert!(
+            lines_to_strings(&appended)
+                .join("\n")
+                .contains("```markdown")
+        );
+
+        let streamed = render_streaming_markdown_agent_with_links_and_cwd(
+            src, /*width*/ None, /*cwd*/ None,
+        );
+        assert!(
+            streamed
+                .lines
+                .iter()
+                .map(|line| {
+                    line.line
+                        .spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                .contains("```markdown")
+        );
+    }
+
+    #[test]
+    fn inline_visualization_edits_preserve_surrounding_math() {
+        let src = concat!(
+            "Before \\(a\\)\n",
+            "::codex-inline-vis{file=\"missing.html\"}\n",
+            "After \\(b\\)",
+        );
+        let normalized = normalize_agent_markdown(src, /*inline_visualization_context*/ None);
+        let prepared = normalized.prepared_math;
+
+        assert_eq!(
+            prepared.source(),
+            "Before \\(a\\)\n_Visualization unavailable on this device._\nAfter \\(b\\)"
+        );
+        let parts = prepared.into_parts();
+        assert_eq!(
+            parts
+                .inline
+                .iter()
+                .map(|span| &parts.source[span.source_range.clone()])
+                .collect::<Vec<_>>(),
+            vec![r"\(a\)", r"\(b\)"],
+        );
     }
 
     #[test]

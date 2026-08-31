@@ -23,6 +23,7 @@ use url::Url;
 use uuid::Uuid;
 
 use self::viewer::materialize_document;
+use crate::math_source::SourceEdit;
 
 pub(crate) const DIRECTIVE_PREFIX: &str = "::codex-inline-vis{";
 const MAX_FRAGMENT_BYTES: u64 = 2 * 1024 * 1024;
@@ -126,6 +127,7 @@ fn is_visualization_thread_dir(visualizations_dir: &Path, path: &Path) -> bool {
 
 pub(crate) struct InlineVisualizationRewrite<'a> {
     pub(crate) markdown: Cow<'a, str>,
+    pub(crate) source_edits: Vec<SourceEdit>,
     // Markdown rendering only recognizes web links. Random placeholders let the renderer build the
     // link ranges normally, then allow the caller to retarget only links created from directives.
     pub(crate) trusted_file_links: HashMap<String, TrustedFileLink>,
@@ -145,6 +147,7 @@ pub(crate) fn rewrite_inline_visualizations<'a>(
     if !markdown.contains(DIRECTIVE_PREFIX) {
         return InlineVisualizationRewrite {
             markdown: Cow::Borrowed(markdown),
+            source_edits: Vec::new(),
             trusted_file_links: HashMap::new(),
         };
     }
@@ -167,6 +170,7 @@ pub(crate) fn rewrite_inline_visualizations<'a>(
     }
 
     let mut rewritten = String::with_capacity(markdown.len());
+    let mut source_edits = Vec::new();
     let mut trusted_file_links = HashMap::new();
     let mut source_offset = 0;
     for source_line in markdown.split_inclusive('\n') {
@@ -179,6 +183,7 @@ pub(crate) fn rewrite_inline_visualizations<'a>(
         let is_code = code_block_ranges
             .iter()
             .any(|range| range.start < source_offset && line_start < range.end);
+        let rewritten_line_start = rewritten.len();
         if is_code || !trimmed.starts_with(DIRECTIVE_PREFIX) {
             rewritten.push_str(line);
         } else if let Some(file) = parse_directive_file(trimmed) {
@@ -204,10 +209,18 @@ pub(crate) fn rewrite_inline_visualizations<'a>(
         } else if trimmed.ends_with('}') {
             rewritten.push_str("_Visualization unavailable on this device._");
         }
+        let replacement = &rewritten[rewritten_line_start..];
+        if replacement != line {
+            source_edits.push(SourceEdit {
+                range: line_start..line_start + line.len(),
+                replacement: replacement.to_string(),
+            });
+        }
         rewritten.push_str(newline);
     }
     InlineVisualizationRewrite {
         markdown: Cow::Owned(rewritten),
+        source_edits,
         trusted_file_links,
     }
 }

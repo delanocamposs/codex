@@ -10,7 +10,6 @@ use std::sync::atomic::Ordering;
 use crossterm::cursor::MoveTo;
 use crossterm::cursor::Show;
 use crossterm::event::KeyCode;
-use crossterm::terminal::EnterAlternateScreen;
 use crossterm::terminal::LeaveAlternateScreen;
 use ratatui::crossterm::execute;
 use ratatui::layout::Rect;
@@ -184,7 +183,7 @@ impl PreparedResumeAction {
                 terminal.set_viewport_area(area);
             }
             PreparedResumeAction::RestoreAltScreen => {
-                execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+                terminal.resume_alternate_screen()?;
                 // Enable "alternate scroll" so terminals may translate wheel to arrows
                 execute!(terminal.backend_mut(), EnableAlternateScroll)?;
                 if let Ok(size) = terminal.size() {

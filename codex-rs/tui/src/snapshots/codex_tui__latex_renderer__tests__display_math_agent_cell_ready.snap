@@ -1,0 +1,11 @@
+---
+source: tui/src/latex_renderer_tests.rs
+assertion_line: 712
+expression: snapshot
+---
+• Before.
+
+  ▧▧▧▧▧▧▧▧▧▧ [Kitty image]
+  ▧▧▧▧▧▧▧▧▧▧ [Kitty image]
+
+  After.

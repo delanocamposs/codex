@@ -1,0 +1,6 @@
+---
+source: tui/src/latex_renderer_tests.rs
+expression: image_snapshot(&rendered)
+---
+• We have 2ab cos C, sin² x+cos² x=1, and
+  K=½mv².

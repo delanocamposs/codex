@@ -49,6 +49,7 @@ pub enum McpLoginRequirement {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum McpAuthState {
     Unsupported,
+    Unknown,
     LoggedOut(McpLoginRequirement),
     BearerToken,
     OAuth,
@@ -58,6 +59,7 @@ impl From<McpAuthState> for McpAuthStatus {
     fn from(value: McpAuthState) -> Self {
         match value {
             McpAuthState::Unsupported => Self::Unsupported,
+            McpAuthState::Unknown => Self::Unknown,
             McpAuthState::LoggedOut(_) => Self::NotLoggedIn,
             McpAuthState::BearerToken => Self::BearerToken,
             McpAuthState::OAuth => Self::OAuth,
@@ -180,7 +182,7 @@ fn determine_auth_status_from_discovery(
             debug!(
                 "failed to detect OAuth support for MCP server `{server_name}` at {url}: {error:?}"
             );
-            Ok(McpAuthState::Unsupported)
+            Err(error)
         }
     }
 }
@@ -346,6 +348,18 @@ mod tests {
                 ))
             })
         }
+    }
+
+    fn assert_recorded_discovery_failure(discovery: Result<Option<StreamableHttpOAuthDiscovery>>) {
+        let error = discovery.expect_err("the recording HTTP client rejects OAuth discovery");
+        assert!(
+            matches!(
+                error.downcast_ref::<AuthError>(),
+                Some(AuthError::MetadataError(reason))
+                    if reason.contains("expected discovery request failure")
+            ),
+            "OAuth discovery must preserve the executor transport failure: {error:#}"
+        );
     }
 
     async fn spawn_oauth_discovery_server(metadata: serde_json::Value) -> TestServer {
@@ -517,6 +531,7 @@ mod tests {
     #[tokio::test]
     async fn oauth_discovery_does_not_follow_cross_origin_redirects() {
         let redirect_target = MockServer::start().await;
+        let redirect_url = format!("{}/redirect-target", redirect_target.uri());
         Mock::given(method("GET"))
             .and(path("/redirect-target"))
             .and(header("x-api-key", "sensitive-key"))
@@ -529,15 +544,14 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/mcp"))
             .and(header("x-api-key", "sensitive-key"))
-            .respond_with(ResponseTemplate::new(302).insert_header(
-                "location",
-                format!("{}/redirect-target", redirect_target.uri()),
-            ))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("location", redirect_url.clone()),
+            )
             .expect(1)
             .mount(&resource_server)
             .await;
 
-        let discovery = discover_streamable_http_oauth(
+        let error = discover_streamable_http_oauth(
             &format!("{}/mcp", resource_server.uri()),
             Some(HashMap::from([(
                 "x-api-key".to_string(),
@@ -548,11 +562,59 @@ mod tests {
             OAuthDiscoveryTimeout::LOCAL,
         )
         .await
-        .expect("discovery should complete without following the redirect");
+        .expect_err("cross-origin OAuth discovery redirects must be rejected");
 
-        assert_eq!(discovery, None);
+        assert!(
+            matches!(
+                error.downcast_ref::<AuthError>(),
+                Some(AuthError::MetadataError(reason))
+                    if reason.contains("OAuth discovery redirect to non-same-origin URL rejected")
+                        && reason.contains(&redirect_url)
+            ),
+            "OAuth discovery must preserve the cross-origin redirect rejection: {error:#}"
+        );
         redirect_target.verify().await;
         resource_server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn determine_auth_status_preserves_transient_http_errors() {
+        for status in [
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::TOO_EARLY,
+            StatusCode::TOO_MANY_REQUESTS,
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/mcp"))
+                .respond_with(ResponseTemplate::new(status.as_u16()))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let error = determine_streamable_http_auth_status(
+                "transient-http-error",
+                &format!("{}/mcp", server.uri()),
+                /*bearer_token_env_var*/ None,
+                /*http_headers*/ None,
+                /*env_http_headers*/ None,
+                OAuthCredentialsStoreMode::File,
+                AuthKeyringBackendKind::default(),
+                test_http_client(),
+                OAuthDiscoveryTimeout::LOCAL,
+            )
+            .await
+            .expect_err("transient OAuth discovery failures must not become unsupported access");
+
+            assert!(
+                matches!(
+                    error.downcast_ref::<AuthError>(),
+                    Some(AuthError::MetadataError(reason)) if reason.contains(status.as_str())
+                ),
+                "auth-status discovery must preserve HTTP {status}: {error:#}"
+            );
+            server.verify().await;
+        }
     }
 
     #[tokio::test]
@@ -594,7 +656,7 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(discovery, Ok(None)));
+        assert_recorded_discovery_failure(discovery);
         assert_eq!(
             *http_client
                 .timeout_ms
@@ -620,7 +682,7 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(discovery, Ok(None)));
+        assert_recorded_discovery_failure(discovery);
         assert_eq!(
             *http_client
                 .timeout_ms
@@ -646,7 +708,7 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(discovery, Ok(None)));
+        assert_recorded_discovery_failure(discovery);
         let headers = http_client
             .headers
             .lock()

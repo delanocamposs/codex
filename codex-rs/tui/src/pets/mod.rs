@@ -9,9 +9,9 @@
 //! resolving a selected pet id, preparing frames for terminal image protocols,
 //! rendering the ambient sprite and picker preview, and preserving enough
 //! metadata for `/pets` to behave like a first-class configuration surface.
-//! It does not own config persistence or popup orchestration; callers must
-//! ensure a built-in asset exists before loading it and must persist the final
-//! selection only after the load succeeds.
+//! It prepares built-in assets before loading pets, but does not own config
+//! persistence or popup orchestration; callers must persist the final selection
+//! only after the load succeeds.
 
 use std::io::Write;
 
@@ -27,7 +27,16 @@ mod sixel;
 
 use anyhow::Context;
 use anyhow::Result;
+use codex_http_client::RouteAwareClientPool;
+use codex_utils_absolute_path::AbsolutePathBuf;
 
+use crate::tui::FrameRequester;
+
+#[cfg(test)]
+pub(crate) use crate::terminal_graphics::ImageProtocol;
+pub(crate) use crate::terminal_graphics::PetImageSupport;
+#[cfg(test)]
+pub(crate) use crate::terminal_graphics::PetImageUnsupportedReason;
 pub(crate) use ambient::AmbientPet;
 pub(crate) use ambient::AmbientPetDraw;
 pub(crate) use ambient::PetNotificationKind;
@@ -36,13 +45,6 @@ pub(crate) use ambient::test_ambient_pet;
 pub(crate) use asset_pack::builtin_spritesheet_path;
 #[cfg(test)]
 pub(crate) use asset_pack::write_test_pack;
-#[cfg(test)]
-pub(crate) use image_protocol::ImageProtocol;
-pub(crate) use image_protocol::PetImageSupport;
-#[cfg(test)]
-pub(crate) use image_protocol::PetImageUnsupportedReason;
-#[cfg(not(test))]
-pub(crate) use image_protocol::detect_pet_image_support;
 pub(crate) use picker::PET_PICKER_VIEW_ID;
 pub(crate) use picker::build_pet_picker_params;
 pub(crate) use preview::PetPickerPreviewState;
@@ -53,18 +55,39 @@ pub(crate) const DISABLED_PET_ID: &str = "disabled";
 /// Ensure that a selected built-in pet has a locally cached spritesheet.
 ///
 /// Custom pets are intentionally a no-op here because their source of truth is
-/// already local. Callers should invoke this before loading a built-in pet for
-/// preview or selection; skipping it would make first-use preview and
-/// persistence failures depend on deeper image-loading errors instead of the
-/// asset-fetch boundary.
-pub(crate) fn ensure_builtin_pack_for_pet(
+/// already local. Preparing this before loading keeps first-use preview and
+/// persistence failures at the asset-fetch boundary rather than surfacing as
+/// deeper image-loading errors.
+async fn ensure_builtin_pack_for_pet(
     pet_id: &str,
     codex_home: &std::path::Path,
+    http_client: &RouteAwareClientPool,
 ) -> Result<()> {
     if let Some(pet) = catalog::builtin_pet(pet_id) {
-        asset_pack::ensure_builtin_pet(codex_home, pet)?;
+        asset_pack::ensure_builtin_pet(codex_home, pet, http_client).await?;
     }
     Ok(())
+}
+
+/// Prepare a pet's built-in assets and load its synchronous state off the runtime.
+pub(crate) async fn load_pet_with_assets(
+    pet_id: String,
+    codex_home: AbsolutePathBuf,
+    frame_requester: FrameRequester,
+    animations_enabled: bool,
+    http_client: &RouteAwareClientPool,
+) -> Result<AmbientPet> {
+    ensure_builtin_pack_for_pet(&pet_id, &codex_home, http_client).await?;
+    tokio::task::spawn_blocking(move || {
+        AmbientPet::load(
+            Some(&pet_id),
+            &codex_home,
+            frame_requester,
+            animations_enabled,
+        )
+    })
+    .await
+    .context("join pet load task")?
 }
 
 #[derive(Debug)]
@@ -133,7 +156,11 @@ fn render_pet_image(
 
     let Some(request) = request else {
         if state.last_protocol.take().is_some_and(is_kitty_protocol) {
-            write!(writer, "{}", image_protocol::kitty_delete_image(image_id))?;
+            write!(
+                writer,
+                "{}",
+                crate::terminal_image::kitty_delete_image(image_id)
+            )?;
         }
         if let Some(area) = state.last_sixel_clear_area.take() {
             queue!(writer, SavePosition)?;
@@ -147,13 +174,17 @@ fn render_pet_image(
     if state.last_protocol.take().is_some_and(is_kitty_protocol)
         || is_kitty_protocol(request.protocol)
     {
-        write!(writer, "{}", image_protocol::kitty_delete_image(image_id))?;
+        write!(
+            writer,
+            "{}",
+            crate::terminal_image::kitty_delete_image(image_id)
+        )?;
     }
     state.last_protocol = Some(request.protocol);
 
     let payload = match request.protocol {
         ImageProtocol::Kitty => AmbientPetPayload::Text(
-            image_protocol::kitty_transmit_png_with_id(
+            crate::terminal_image::kitty_transmit_png_with_id(
                 &request.frame,
                 request.columns,
                 request.rows,
@@ -162,7 +193,7 @@ fn render_pet_image(
             .map_err(PetImageRenderError::Asset)?,
         ),
         ImageProtocol::KittyLocalFile => AmbientPetPayload::Text(
-            image_protocol::kitty_transmit_png_file_with_id(
+            crate::terminal_image::kitty_transmit_png_file_with_id(
                 &request.frame,
                 request.columns,
                 request.rows,
